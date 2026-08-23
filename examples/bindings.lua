@@ -31,25 +31,27 @@ hl.bind(
 )
 
 -- ---------------------------------------------------------------------------
--- Optional power-user binding: SUPER + ALT + M
+-- Optional power-user binding: SUPER + CTRL + M
 --
 -- Always stashes, regardless of current stash state — unlike SUPER+M this
 -- never restores. Useful for cumulative keyboard-driven stashing across
 -- several workspaces before restoring them all at once elsewhere:
 --
---   Workspace 1 -> SUPER+ALT+M -> add its windows
---   Workspace 3 -> SUPER+ALT+M -> add its windows
---   Workspace 7 -> SUPER+M     -> restore everything here
+--   Workspace 1 -> SUPER+CTRL+M -> add its windows
+--   Workspace 3 -> SUPER+CTRL+M -> add its windows
+--   Workspace 7 -> SUPER+M      -> restore everything here
 --
 -- Same conflict caveat as SUPER+M: check `omarchy menu keybindings --print`
--- first (SUPER+SHIFT+M is already Omarchy's default Music/Spotify launcher,
--- which is why that combo is avoided here). This is just another thin
--- adapter over the same stash() IPC call used everywhere else — there is no
--- separate "cumulative stash" operation.
+-- first. SUPER+CTRL+M was chosen over SUPER+ALT+M (an earlier revision of
+-- this doc) after confirming SUPER+SHIFT+ALT+M is Omarchy's default Music
+-- TUI launcher and SUPER+SHIFT+M is its default Music/Spotify launcher —
+-- SUPER+CTRL+M avoids both, and reads as a natural pairing with SUPER+M.
+-- This is just another thin adapter over the same stash() IPC call used
+-- everywhere else — there is no separate "cumulative stash" operation.
 -- ---------------------------------------------------------------------------
 
 hl.bind(
-  "SUPER + ALT + M",
+  "SUPER + CTRL + M",
   hl.dsp.exec_cmd([[omarchy-shell -q workspace-stash stash]]),
   { description = "Stash current workspace (cumulative)" }
 )

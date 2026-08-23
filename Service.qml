@@ -7,8 +7,12 @@ import Quickshell.Hyprland
 // windows are currently stashed: a window is "in the stash" iff it is a live
 // Hyprland toplevel parked on stashWorkspace. `meta` below is auxiliary V2
 // bookkeeping (pre-move geometry, batch id, source workspace) only — it is
-// pruned to whatever is actually parked and never consulted to decide
-// membership, so it can never drift into a second authoritative state.
+// never consulted to decide membership, so it can never drift into a second
+// authoritative state. Entries are removed explicitly, not by polling "is
+// this still parked": restore() drops an address's entry the moment it
+// restores it, and pruneMeta() drops one only once its window is gone for
+// good (closed) — see pruneMeta() for why "currently parked" specifically
+// was the wrong condition to key that on.
 Item {
   id: root
 
@@ -50,12 +54,24 @@ Item {
     }
   })
 
-  // Drop auxiliary entries for windows no longer parked (restored or closed
-  // while hidden). Keeps `meta` bounded by the current stash, never larger.
+  // Drop auxiliary entries for windows that no longer exist at all (closed
+  // while hidden). Deliberately keyed on "does this window still exist
+  // anywhere" (root.meta vs. the full toplevel list), not "is it currently
+  // parked in the stash" (root.meta vs. stashedToplevels): stash()'s own
+  // moveAddress() calls land in Hyprland one at a time, asynchronously, so
+  // stashedToplevels updates window-by-window as each move is actually
+  // applied. Keying prune on stashedToplevels pruned a freshly-stashed
+  // window's own meta entry the instant a *different* window in the same
+  // batch happened to land first — confirmed in testing to silently wipe
+  // 2 of 3 windows' captured geometry/order data on every multi-window
+  // stash. A window only needs pruning once it's gone for good, i.e. no
+  // longer a toplevel anywhere — moving between workspaces never removes
+  // it from that list, only closing it does.
   function pruneMeta() {
     var live = {}
-    for (var i = 0; i < stashedToplevels.length; i++) {
-      live[root.normalizedAddress(stashedToplevels[i])] = true
+    var values = Hyprland.toplevels && Hyprland.toplevels.values ? Hyprland.toplevels.values : []
+    for (var i = 0; i < values.length; i++) {
+      live[root.normalizedAddress(values[i])] = true
     }
     var next = {}
     for (var addr in root.meta) {
@@ -77,59 +93,198 @@ Item {
     Quickshell.execDetached(["hyprctl", "dispatch", request])
   }
 
-  // Snapshot helper: reads the live Hyprland model once into a plain JS
-  // array. Callers must finish reading before issuing any moves — never
-  // iterate a live Hyprland collection while relocating its members.
-  function eligibleWindowsOn(workspaceName) {
-    var list = []
-    var values = Hyprland.toplevels && Hyprland.toplevels.values ? Hyprland.toplevels.values : []
-    for (var i = 0; i < values.length; i++) {
-      var t = values[i]
-      if (!t || !t.workspace || t.workspace.name !== workspaceName) continue
-      var ipc = t.lastIpcObject || null
-      list.push({
-        address: root.normalizedAddress(t),
-        x: ipc && Array.isArray(ipc.at) ? ipc.at[0] : 0,
-        y: ipc && Array.isArray(ipc.at) ? ipc.at[1] : 0,
-        width: ipc && Array.isArray(ipc.size) ? ipc.size[0] : 0,
-        height: ipc && Array.isArray(ipc.size) ? ipc.size[1] : 0,
-        floating: !!(ipc && ipc.floating),
-        appId: (t.wayland && t.wayland.appId) || (ipc && ipc.class) || "",
-        title: t.title || ""
-      })
-    }
-    return list
+  // Builds one "dispatch <expr>" clause for hyprctl --batch. Never fired
+  // standalone during restore() — see structureClauses()/geometryClauses()
+  // below for why.
+  function dispatchClause(luaExpr) {
+    return "dispatch " + luaExpr
   }
+
+  // Phase 1 of restoring one window: place it and, for a tiled window,
+  // focus it so the *next* window's insertion splits against it (see
+  // restoreOrder() below). Deliberately builds only the tree topology —
+  // no sizing here. See geometryClauses() below for why that has to wait
+  // until every window's structureClauses() has already run.
+  //
+  // Returns clauses to be collected and fired as ONE combined `hyprctl
+  // --batch` call across the *whole* restore (see restore() below), not
+  // dispatched per window: separate per-window processes, even each
+  // individually batched, aren't guaranteed to reach Hyprland in the
+  // order they were spawned in — OS process scheduling doesn't promise
+  // that — so under fast repeated restores a later window's move could
+  // land before an earlier one's focus, silently reassigning which
+  // window ends up in which split. One process for the entire sequence
+  // removes that cross-window ordering gap. (stash() doesn't need this —
+  // moveAddress() alone is enough there, since park order in the hidden
+  // workspace is never read back.)
+  function structureClauses(address, destination, meta) {
+    if (!address || !destination) return []
+    var move = "hl.dsp.window.move({ workspace = " + JSON.stringify(destination)
+      + ", window = " + JSON.stringify("address:" + address) + ", follow = false })"
+    if (meta && meta.floating) return [move].map(root.dispatchClause)
+    var focus = "hl.dsp.focus({ window = " + JSON.stringify("address:" + address) + " })"
+    return [move, focus].map(root.dispatchClause)
+  }
+
+  // Phase 2: restore captured size (and, for floating, position) — for
+  // every window, tiled or not, using the exact same absolute resize
+  // dispatch either way (confirmed empirically: Dwindle accepts an
+  // absolute { x = width, y = height } resize on a tiled window the same
+  // as a floating one, adjusting its sibling to compensate). This has to
+  // run only after ALL of this restore's structureClauses() have already
+  // been dispatched, not interleaved per window: Dwindle re-splits evenly
+  // whenever a new window is inserted, so resizing window N to its
+  // captured ratio and *then* inserting window N+1 would just reset N
+  // back to an even split. Building the whole tree first and sizing
+  // everything after avoids that.
+  function geometryClauses(address, meta, monitor) {
+    if (!address || !meta || !(meta.width > 0) || !(meta.height > 0)) return []
+    var resize = "hl.dsp.window.resize({ x = " + Math.round(meta.width)
+      + ", y = " + Math.round(meta.height)
+      + ", window = " + JSON.stringify("address:" + address) + " })"
+    if (!meta.floating) return [resize].map(root.dispatchClause)
+    var pos = root.clampToMonitor(meta.x, meta.y, meta.width, meta.height, monitor)
+    var position = "hl.dsp.window.move({ x = " + Math.round(pos.x)
+      + ", y = " + Math.round(pos.y)
+      + ", relative = false, window = " + JSON.stringify("address:" + address) + " })"
+    return [resize, position].map(root.dispatchClause)
+  }
+
+  // Keeps a restored floating window on-screen when the destination
+  // monitor is smaller than the one its geometry was captured on.
+  function clampToMonitor(x, y, width, height, monitor) {
+    if (!monitor) return { x: x, y: y }
+    var maxX = monitor.x + Math.max(monitor.width - width, 0)
+    var maxY = monitor.y + Math.max(monitor.height - height, 0)
+    return {
+      x: Math.min(Math.max(x, monitor.x), maxX),
+      y: Math.min(Math.max(y, monitor.y), maxY)
+    }
+  }
+
+  // Best-effort restore order for tiled windows: Dwindle derives its split
+  // tree from insertion order, so restoring in an order that approximates
+  // the original spatial arrangement lands materially closer to the
+  // original layout than an arbitrary order — without the failure-prone
+  // work of actually inferring the split tree from geometry alone (see
+  // docs/FEATURES.md §7.3-7.4 on why that's hard and out of scope here).
+  // Batches restore oldest first; within a batch, windows sort in reading
+  // order. A window with no surviving meta (e.g. a shell restart wiped it)
+  // sorts as batch 0 — i.e. today's unordered behavior, the intended
+  // fallback when there's nothing to order by.
+  //
+  // Order alone isn't enough, though: Dwindle splits whichever tiled
+  // window is currently *active*, not just "the last one inserted", so
+  // restore() also has to focus each tiled window right after moving it
+  // in (see structureClauses() above) to keep that active-window chain
+  // matching what it was during the original stash. Tested without that
+  // focus step, order alone reproduced the original layout for 2 windows
+  // but reliably scrambled it for 3+. It also doesn't touch size at all —
+  // see geometryClauses() above for why ratio restoration has to be a
+  // fully separate pass, run only after every window's structure is
+  // already in place.
+  //
+  // Windows sharing a tile don't always report exactly the same y — a
+  // grouped/tabbed window's captured y sits a bit lower than an ungrouped
+  // neighbor at the same visual row, because the group's tab bar pushes
+  // its content down (confirmed empirically: ~28px for a 2-tab group).
+  // Treating that as "a different row" ranked the group after a window
+  // that was actually to its right, swapping their left/right placement
+  // on restore even though the group itself stayed intact. rowTolerance
+  // absorbs that kind of minor chrome offset (tab bars, borders, gaps)
+  // without being wide enough to blur two genuinely stacked windows into
+  // the same row.
+  readonly property int rowTolerance: 40
+
+  function restoreOrder(addresses) {
+    var meta = root.meta
+    return addresses.slice().sort(function(a, b) {
+      var ma = meta[a] || null
+      var mb = meta[b] || null
+      var batchA = ma ? ma.batchId : 0
+      var batchB = mb ? mb.batchId : 0
+      if (batchA !== batchB) return batchA - batchB
+      var yA = ma ? ma.y : 0
+      var yB = mb ? mb.y : 0
+      if (Math.abs(yA - yB) > root.rowTolerance) return yA - yB
+      var xA = ma ? ma.x : 0
+      var xB = mb ? mb.x : 0
+      return xA - xB
+    })
+  }
+
+  property string pendingStashWorkspace: ""
+  property int pendingStashBatchId: 0
 
   // Move every eligible window on the focused normal workspace into the
   // stash. Safe to call repeatedly: it appends to whatever is already
-  // parked rather than replacing it.
+  // parked rather than replacing it. Both *which* windows are eligible and
+  // their geometry come from finishStash() below, off one fresh hyprctl
+  // query — not from Hyprland.toplevels. That cache was tried for
+  // eligibility first (geometry alone was fixed this way earlier), but
+  // under fast repeated stash/restore cycling a window's cached workspace
+  // membership can still briefly read as wherever it was *before* the
+  // previous cycle's move, not after — silently grabbing the wrong subset
+  // and leaving stale geometry/order data behind for whatever got missed.
+  // Only the workspace identity to stash *from* is read synchronously
+  // here, from Hyprland.focusedWorkspace — that tracked reliably in
+  // testing; only per-window state was the unreliable part.
   function stash() {
     var workspace = Hyprland.focusedWorkspace
     if (!workspace || String(workspace.name).indexOf("special:") === 0) return "no-workspace"
+    if (stashCaptureProcess.running) return "busy"
 
-    var snapshot = root.eligibleWindowsOn(workspace.name)
-    if (snapshot.length === 0) return "empty"
+    root.pendingStashWorkspace = workspace.name
+    root.pendingStashBatchId = root.nextBatchId
+    root.nextBatchId = root.pendingStashBatchId + 1
+    stashCaptureProcess.running = true
+    return "ok"
+  }
 
-    var batchId = root.nextBatchId
-    root.nextBatchId = batchId + 1
+  Process {
+    id: stashCaptureProcess
+    command: ["hyprctl", "-j", "clients"]
+    stdout: StdioCollector {
+      id: stashCaptureOutput
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      var clients = []
+      if (exitCode === 0) {
+        try { clients = JSON.parse(stashCaptureOutput.text || "[]") } catch (e) { clients = [] }
+      }
+      root.finishStash(clients)
+    }
+  }
 
+  // Determines eligibility *and* captures geometry from the same fresh
+  // query, then issues the moves — one ground-truth source for both,
+  // instead of letting them potentially disagree.
+  function finishStash(clients) {
     var nextMeta = {}
     for (var addr in root.meta) nextMeta[addr] = root.meta[addr]
 
-    for (var i = 0; i < snapshot.length; i++) {
-      var w = snapshot[i]
-      if (!w.address) continue
-      nextMeta[w.address] = {
-        batchId: batchId,
-        sourceWorkspace: workspace.name,
-        x: w.x, y: w.y, width: w.width, height: w.height,
-        floating: w.floating, appId: w.appId, title: w.title
+    var movedAny = false
+    for (var i = 0; i < clients.length; i++) {
+      var c = clients[i]
+      if (!c || !c.workspace || c.workspace.name !== root.pendingStashWorkspace) continue
+      var address = root.normalizedAddress({ address: c.address })
+      if (!address) continue
+      nextMeta[address] = {
+        batchId: root.pendingStashBatchId,
+        sourceWorkspace: root.pendingStashWorkspace,
+        x: Array.isArray(c.at) ? c.at[0] : 0,
+        y: Array.isArray(c.at) ? c.at[1] : 0,
+        width: Array.isArray(c.size) ? c.size[0] : 0,
+        height: Array.isArray(c.size) ? c.size[1] : 0,
+        floating: !!c.floating,
+        appId: c.class || "",
+        title: c.title || ""
       }
-      root.moveAddress(w.address, root.stashWorkspace, false)
+      root.moveAddress(address, root.stashWorkspace, false)
+      movedAny = true
     }
-    root.meta = nextMeta
-    return "ok"
+    if (movedAny) root.meta = nextMeta
   }
 
   // Restore the complete surviving stash — everything currently parked on
@@ -145,8 +300,19 @@ Item {
     if (!workspace) return "no-workspace"
     var destination = workspace.name
 
-    for (var i = 0; i < snapshot.length; i++) {
-      root.moveAddress(snapshot[i], destination, false)
+    var monitor = workspace.monitor || null
+    var ordered = root.restoreOrder(snapshot)
+    var structure = []
+    var geometry = []
+    for (var i = 0; i < ordered.length; i++) {
+      var address = ordered[i]
+      var m = root.meta[address]
+      structure = structure.concat(root.structureClauses(address, destination, m))
+      geometry = geometry.concat(root.geometryClauses(address, m, monitor))
+    }
+    var clauses = structure.concat(geometry)
+    if (clauses.length > 0) {
+      Quickshell.execDetached(["hyprctl", "--batch", clauses.join(" ; ")])
     }
 
     var nextMeta = {}
@@ -184,17 +350,22 @@ Item {
   //      event when a special workspace empties out on its own, so a
   //      purely event-driven flag can race and skip deactivation on
   //      exactly the case this exists to catch.
-  //   3. No explicit refocus is issued afterward. Hyprland silently
-  //      substitutes its own top-of-stack window for any focus request
-  //      into an already-populated special workspace, and that
-  //      substitution isn't recoverable from the IPC/event stream —
-  //      forcing focus onto it would misrepresent it as the user's actual
-  //      request.
+  //   3. No explicit refocus is issued afterward chasing what the external
+  //      shortcut was trying to reach. Hyprland silently substitutes its
+  //      own top-of-stack window for any focus request into an
+  //      already-populated special workspace, and that substitution isn't
+  //      recoverable from the IPC/event stream — forcing focus onto it
+  //      would misrepresent it as the user's actual request. (restore()
+  //      does focus each tiled window as it's placed, for Dwindle
+  //      ordering — see restoreOrder() — which leaves the last restored
+  //      tiled window focused when this collision path finishes. That's
+  //      an unrelated, intentional side effect of getting the layout
+  //      right, not a refocus attempt aimed at the collision itself.)
   //
   // The whole stash restores through the one authoritative restore() every
   // other input path already uses. Deactivation only ever fires from the
   // confirmed-active check in finishCollisionRestore() below, so ordinary
-  // stash()/restore() calls (swipe gestures, SUPER+M, SUPER+ALT+M) can
+  // stash()/restore() calls (swipe gestures, SUPER+M, SUPER+CTRL+M) can
   // never accidentally open the special workspace themselves.
   property bool collisionRestoreInFlight: false
 

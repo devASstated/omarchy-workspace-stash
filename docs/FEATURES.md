@@ -4,7 +4,7 @@
 
 Target: Omarchy Quattro / Hyprland / Quickshell 
 
-Status: V1 scope locked; V2 direction reserved 
+Status: V1 and V2 scope locked; V3 direction reserved 
 
 Scope rule: preserve the agreed user-facing behavior first; prefer the smallest event-driven architecture that implements it correctly. Implementation details may evolve, but V1/V2 semantics in this document are the project contract. 
 

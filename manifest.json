@@ -4,6 +4,7 @@
   "name": "Workspace Stash",
   "version": "0.1.0",
   "author": "Elnathan Hod",
+  "license": "MIT",
   "description": "Workspace-level minimize/restore: stash every window on the current workspace and restore the accumulated set with a gesture or SUPER+M.",
   "kinds": ["service", "bar-widget"],
   "entryPoints": {

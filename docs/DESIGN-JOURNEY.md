@@ -370,12 +370,269 @@ Two limits of that approach are worth recording:
   performed against a written procedure, rather than end-to-end automated
   UI clicking.
 
+## 11. V2: choosing the smallest reconstruction that could work
+
+`docs/FEATURES.md` §7.4 describes the full target for layout-preserving
+restore: group captured rectangles by batch, infer an actual binary split
+tree from their edges/containment/adjacency, and drive restore through
+controlled Dwindle preselect and ratio-adjustment dispatches. The same
+section already names why that's hard — two different trees can produce
+windows with identical dimensions, so geometry alone can't be inverted
+back into a tree reliably.
+
+Before writing any V2 code, a deliberately smaller alternative was
+proposed and agreed on instead of the full algorithm: restore tiled
+windows in an order approximating their original position (Dwindle splits
+whichever window is currently active, so *order* alone gets a real-world
+layout materially closer without inferring a tree at all), and restore
+floating windows from their captured geometry directly, since they sit
+outside the tiling tree entirely and don't need any inference. This was a
+scope decision made and approved before implementation began, not a
+shortcut discovered after the fact — and, as later sections show, its
+edges turned out to be exactly where the rejected full algorithm would
+have been needed.
+
+## 12. Building a test harness, and the tooling problems that came before the real ones
+
+V1 was validated mostly by hand — disposable windows and a written
+click-testing procedure, because no click-simulation tool was available.
+V2's behavior is almost entirely inspectable through `hyprctl`/`omarchy-shell`
+directly, so a Python harness was built to drive stash/restore through the
+same commands a gesture or keybinding would, snapshot window geometry
+before and after with `hyprctl -j clients`, and assert on the result — far
+faster than re-running a manual procedure after every change, and just as
+grounded in the real compositor.
+
+Three tooling problems surfaced before any real product bug did, each
+worth recording because each one produced misleading results that looked
+like product bugs at first:
+
+- **`pkill` is blocked by the execution sandbox.** A cleanup helper that
+  killed disposable test windows by process name failed silently — the
+  command exited with a signal-like code but the *test script* kept
+  running as if cleanup had succeeded, silently accumulating leftover
+  windows across test runs and corrupting later results in ways that
+  looked exactly like ordering bugs. Fixed by closing windows through
+  `hyprctl` by address (`hl.dsp.window.close`) instead of `pkill` — the
+  same address-based approach the plugin itself uses, which sidesteps the
+  sandbox restriction entirely.
+
+- **A shell-quoting bug in the test harness itself.** Every dispatch call
+  built as `hyprctl dispatch "hl.dsp....(window = \"address:...\")"` and
+  run through a shell silently had its *inner* quotes stripped by the
+  shell before Lua ever saw them, turning a valid Lua string literal into
+  a syntax error that the harness didn't check for. Every dispatch in an
+  early test run silently failed this way — spawning windows worked
+  (that path didn't use this pattern), but every subsequent float/resize/
+  move/focus/close call did nothing, producing results that looked
+  exactly like the plugin was scrambling window state, when the plugin
+  had not actually been exercised at all. Fixed by passing the Lua
+  expression as a single argv element (`["hyprctl", "dispatch", request]`,
+  no shell), matching the exact pattern `Service.qml` itself already uses
+  via `Quickshell.execDetached`.
+
+- **Legacy dispatcher syntax, rediscovered.** `hyprctl dispatch <name>
+  <args>` (and even `hyprctl output create headless`'s workspace-focus
+  helper) fails under Quattro's Lua-based dispatch bridge, the same lesson
+  V1 already learned for the plugin's own code (§3) — this time hitting
+  the *test harness*, which had reintroduced the legacy form. Every
+  `hl.dsp.*` call had to be verified as a full Lua expression string
+  first.
+
+With all three fixed, the harness became trustworthy enough to actually
+find the real bugs below — each confirmed with before/after `hyprctl`
+snapshots, not inferred from test output alone.
+
+## 13. Bug: `pruneMeta()` deleting a stash mid-flight
+
+The first real product bug: restoring a 3-window stash reliably lost 2 of
+the 3 windows' captured order/geometry data. A temporary debug IPC method
+was added to `Service.qml` to inspect `root.meta` directly after `stash()`
+— not guessed at — and it showed only one entry surviving out of three,
+immediately after a `stash()` call that should have produced three.
+
+The cause: `stash()`'s window-move dispatches land in Hyprland one at a
+time, asynchronously. `pruneMeta()` ran on every partial update of
+`stashedToplevels` (the reactive "what's currently parked" view) and, keyed
+on that same property, treated "hasn't landed in the stash yet" as "no
+longer needs tracking" — deleting a freshly-written meta entry the instant
+a *different* window in the same batch happened to land first. Fixed by
+re-keying the prune condition on "does this window still exist as a
+toplevel anywhere" (only true once a window is closed) instead of
+"is it currently parked" — a window moving between workspaces was never a
+reason to forget its metadata; only closing it is.
+
+## 14. Bug: geometry read from a cache that wasn't populated yet
+
+Fixing the prune race didn't fix restored floating windows landing at the
+wrong position — the same debug method showed *why*: for a window that had
+just been created or resized, Quickshell's cached `lastIpcObject` was
+missing its `at`/`size`/`floating` fields entirely, not merely behind.
+`eligibleWindowsOn()`'s existing fallback (`ipc && Array.isArray(ipc.at) ?
+... : 0`) silently captured zeroed, garbage geometry for exactly the
+windows a repeated stash/restore cycle touches most — the ones that were
+just moved a moment earlier.
+
+The fix mirrors a pattern V1 already established for a different reason
+(§6): bypass Quickshell's cache with a fresh, direct `hyprctl -j clients`
+query. Here it was applied more broadly than before — not just to confirm
+special-workspace deactivation, but to decide *both* which windows are
+eligible to stash *and* their geometry, from one ground-truth snapshot,
+rather than trusting `Hyprland.toplevels` for either. A first attempt kept
+eligibility on the Quickshell-cached path and only moved geometry capture
+to the fresh query; that still occasionally grabbed the wrong subset of
+windows under fast repeated cycling, so eligibility was moved to the same
+fresh query too.
+
+## 15. Bug: cross-window dispatch ordering
+
+With capture fixed, a 2-window restore still occasionally swapped which
+window ended up in which position — but only under fast repeated cycling,
+and the *set* of window sizes was always correct, only the identity-to-slot
+assignment was wrong. A raw `hyprctl` reproduction outside the plugin,
+issuing the exact same per-window `--batch` dispatch sequence restore()
+already used, never reproduced the bug — pointing at something specific to
+how the plugin issued the sequence, not the dispatches themselves.
+
+The cause: each window's `[move, focus]` (or `[move, resize, position]`)
+pair was already atomic as one `--batch` call, but *different* windows'
+batches were still separate `Quickshell.execDetached` processes with no
+guarantee about the order they'd reach Hyprland relative to each other —
+ordinary OS process-scheduling variance, not something the plugin
+controlled. Under fast repeated restores, a later window's move could
+occasionally land before an earlier one's focus-for-ordering call, quietly
+reassigning which window ended up in which split. Fixed by combining the
+*entire* restore sequence — every window's placement and follow-up — into
+one `hyprctl --batch` call, removing the inter-process ordering gap
+entirely rather than trying to narrow it.
+
+## 16. A user-taught reproduction finds the row-tolerance bug
+
+Testing whether Hyprland window groups (tabbed windows) survive stash/
+restore required first learning how to create one — Omarchy's own
+`SUPER+G`/`SUPER+ALT+LEFT-RIGHT-UP-DOWN` group bindings, confirmed active
+via `hyprctl binds` before use. A 2-tile layout (one group, one plain
+window) restored perfectly; adding a third, unrelated window changed the
+layout on restore.
+
+Isolating the cause showed the group itself was never the problem — the
+same failure reproduced identically with three plain, ungrouped windows in
+a true 2×2 grid, and separately with a grouped one. The real cause: a
+grouped window's tab bar pushes its captured `y` down by a small,
+consistent offset (confirmed empirically at ~28px for a 2-tab group)
+compared to an ungrouped window at the same visual row. `restoreOrder()`'s
+sort treated any `y` difference as "a different row," so it occasionally
+ranked a window before a group that was actually beside it, swapping their
+left/right placement even though the group itself stayed correctly
+intact throughout. Fixed with a small tolerance (40px) on the row
+comparison — wide enough to absorb chrome offsets like tab bars, gaps, and
+borders, not wide enough to blur two genuinely stacked windows together.
+
+## 17. Ratio preservation, and where "smallest lightweight" hits its wall
+
+Order-only restore never touched window *size* for tiled windows — a
+deliberately asymmetric split (one window resized far larger than its
+sibling) reliably came back as an even 50/50 split on restore, even though
+position and order were both correct by this point. Confirmed cheap to fix
+once tested directly: Hyprland's absolute resize dispatch
+(`hl.dsp.window.resize({ x = width, y = height, ... })`) works identically
+on a tiled window as on a floating one, adjusting its sibling to
+compensate — the same mechanism already used for floating geometry could
+restore tiled ratios too, using width/height V1 already captured.
+
+Getting the sequencing right required splitting `restore()`'s dispatch
+building into two phases within the same combined batch: phase 1 places
+every window and builds the tree topology (unchanged from §15); phase 2,
+run only *after* the whole tree exists, resizes every window to its
+captured size. Interleaving the two — resizing a window immediately after
+placing it, before the next window is inserted — doesn't work, because
+Dwindle re-splits evenly whenever a new window arrives, silently resetting
+an already-restored ratio the moment its sibling shows up.
+
+That fix, tested and confirmed working for straightforward splits,
+surfaced a deeper and uglier failure one layer down: a window inserted
+into an already-split pair (for example, a third window added inside the
+larger half of an asymmetric two-way split, or any true 2×2 grid — two
+independently-split columns) doesn't just lose its ratio, it can scramble
+into a different topology entirely. Root cause traced precisely:
+`restoreOrder()`'s sort produces a flat sequence, and phase 1 always
+places each window by splitting whichever single window is currently
+active — a *linear chain* of splits. It has no way to express "insert this
+window as a sibling of an already-built pair," which is exactly what a
+branching layout like a 2×2 grid requires. Reconstructing that correctly
+is precisely the full split-tree inference `FEATURES.md` §7.4 describes
+and §11 above deliberately chose not to build. Given a choice between
+attempting a partial, order-dependent patch for this specific shape (risking
+exactly the kind of brittle special-casing this project has avoided
+throughout) and accepting the boundary, the boundary was accepted, and
+documented directly in `restoreOrder()`'s and `structureClauses()`'s code
+comments rather than papered over.
+
+## 18. Correcting a keybind decision against upstream, not just the local install
+
+Switching the cumulative-stash binding from `SUPER+ALT+M` to `SUPER+CTRL+M`
+(for a cleaner mnemonic pairing with `SUPER+M`, once digit-key testing
+for a planned V3 feature revealed `SUPER+ALT+<digit>` was already claimed)
+was first checked only against the live `hyprctl binds` output on the
+development machine — which also reflects local customizations and
+installed third-party plugins, not just Omarchy's own defaults. Asked
+directly whether upstream had been checked, not just the local config, the
+claim was verified a second way: fetching Omarchy's actual default
+keybinding files from `basecamp/omarchy` (the `quattro` branch) on GitHub
+and searching all six of them directly. That check also caught a factual
+error in the first pass — `SUPER+ALT+M` had been described as an existing
+Omarchy default (confused with `SUPER+SHIFT+ALT+M`, its actual Music-TUI
+binding); the correction was written into both `examples/bindings.lua` and
+the local test binding's comment once confirmed.
+
+## 19. V3 candidates surfaced, deliberately not built here
+
+Several ideas came up during V2 testing and design discussion that were
+judged worth pursuing, but out of scope for this pass — kept as a clean
+backlog rather than folded into a commit whose stated scope is
+layout-preserving restore:
+
+- **Bulk workspace-move** (proposed keybinding: `SUPER+CTRL+SHIFT+1-9`,
+  confirmed free against both the live install and upstream Omarchy
+  defaults): move everything on the current workspace to workspace N,
+  preserving layout best-effort, without following the view there and
+  without touching the stash at all — a distinct, stateless operation
+  reusing most of V2's restore machinery, not an extension of stash/
+  restore semantics. Nothing in Hyprland or Omarchy provides this today;
+  confirmed by checking Omarchy's own command list and Hyprland's
+  dispatcher set directly rather than assuming.
+- **Advanced overflow display settings**: a choice between `…`-style and
+  `+N`-style overflow indicators, and between a running total and a
+  leftover-only count — noted as a plausible V2 setting back in §8 and
+  explicitly deferred again here.
+- **A keybindings reference panel** in the bar widget's right-click menu:
+  the documented keyboard/gesture snippets shown directly in the settings
+  popover with a copy affordance, plus a button to open the relevant
+  Hyprland config file (`bindings.lua` for keyboard shortcuts,
+  `input.lua` for gestures — two different files, so likely two separate
+  open targets). Modeled on a real precedent found in another installed
+  plugin (`ilyazar.btop`), which opens the user's `bindings.lua` directly
+  from its own settings row rather than auto-writing to it — the same
+  "never modify user config automatically" principle this project has
+  followed throughout, just with less friction for the user who chooses
+  to do it themselves.
+
 ## Status at the end of this document
 
-V1's core stash/restore/toggle behavior, the external-focus collision
-lifecycle, and the bar interaction pass (click-to-restore, the display
-style menu, and the two overflow limits) are all implemented and verified
-against a real Hyprland session. `README.md`, `LICENSE`, and the final
-plugin id (still the placeholder `io.github.REPLACE_ME.workspace-stash`)
-remain outstanding before this is ready for public release. No V2 work —
-layout-preserving restore — has been started.
+V1's full scope and V2's layout-preserving restore — batch-ordered tiled
+reconstruction, exact floating-geometry restore including cross-monitor
+clamping, and split-ratio preservation — are implemented and verified
+against a real Hyprland session, including edge cases (Hyprland groups,
+shell restarts, rapid repeated cycling, external-focus collisions) beyond
+what either `FEATURES.md` release-discipline checklist enumerates by name.
+One limitation is accepted and documented rather than fixed: layouts where
+a window is inserted beside an already-built group of windows, not the
+single most-recently-placed one — a 2×2 grid is the clearest example —
+aren't reliably reconstructed, because that requires the full split-tree
+inference `FEATURES.md` §7.4 already named as hard and this project chose
+not to build. `LICENSE` and this document are current; `README.md` was
+written alongside this update. The plugin id remains the placeholder
+`io.github.REPLACE_ME.workspace-stash`, pending a real GitHub namespace
+before publishing. Three ideas raised during V2 — bulk workspace-move,
+advanced overflow settings, and a keybindings reference panel — are
+captured in §19 as V3 candidates, not started.
