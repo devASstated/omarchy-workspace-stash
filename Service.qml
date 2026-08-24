@@ -38,6 +38,18 @@ Item {
   readonly property int count: stashedToplevels.length
   readonly property bool hasStash: count > 0
 
+  // Title/app-id are set by whatever application owns the window, not by
+  // Hyprland or this plugin — an unbounded string here would let a single
+  // misbehaving window force this reactively-recomputed property to hold
+  // and copy an arbitrarily large string on every toplevel-list change.
+  // Clipped at the collector, before it ever reaches BarWidget.qml.
+  readonly property int maxDisplayTextLength: 100
+
+  function clipText(value, maxLength) {
+    var str = String(value || "")
+    return str.length > maxLength ? str.slice(0, maxLength) : str
+  }
+
   // Presentation-ready snapshot for the bar widget: identity and live display
   // fields come straight from Hyprland every time; batch/source come from the
   // auxiliary map when available.
@@ -47,8 +59,8 @@ Item {
     var m = root.meta[address] || null
     return {
       address: address,
-      title: t.title || "",
-      appId: (t.wayland && t.wayland.appId) || (ipc && ipc.class) || "",
+      title: root.clipText(t.title, root.maxDisplayTextLength),
+      appId: root.clipText((t.wayland && t.wayland.appId) || (ipc && ipc.class) || "", root.maxDisplayTextLength),
       batchId: m ? m.batchId : 0,
       sourceWorkspace: m ? m.sourceWorkspace : ""
     }

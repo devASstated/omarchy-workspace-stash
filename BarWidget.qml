@@ -296,6 +296,11 @@ BarWidget {
         anchors.verticalCenter: parent.verticalCenter
         width: Math.min(root.maxNamesWidth, implicitWidth)
         text: root.namesShownText
+        // namesShownText is built from window titles/app-ids, which the
+        // owning application controls, not Hyprland or this plugin — force
+        // literal rendering so a title crafted to look like markup can't be
+        // interpreted by QML's default rich-text auto-detection.
+        textFormat: Text.PlainText
         elide: Text.ElideRight
         color: root.bar ? root.bar.barForeground : Color.foreground
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
