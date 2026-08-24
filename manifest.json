@@ -1,18 +1,18 @@
 {
   "schemaVersion": 1,
   "id": "io.github.devASstated.workspace-stash",
-  "name": "Workspace Stash",
+  "name": "Workspace Windows Stasher",
   "version": "0.2.0",
   "author": "Elnathan Hod",
   "license": "MIT",
-  "description": "Workspace-level minimize/restore: stash every window on the current workspace and restore the accumulated set with a gesture or SUPER+M.",
+  "description": "Workspace-level minimize/restore: stash every window from the current workspace and restore the whole set wherever you are, layout preserved.",
   "kinds": ["service", "bar-widget"],
   "entryPoints": {
     "service": "Service.qml",
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Workspace Stash",
+    "displayName": "Workspace Windows Stasher",
     "description": "Shows the current stash and its contents",
     "category": "Compositor",
     "aliases": ["minimize", "stash", "windows"],
