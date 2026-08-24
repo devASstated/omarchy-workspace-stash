@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.REPLACE_ME.workspace-stash",
+  "id": "io.github.devASstated.workspace-stash",
   "name": "Workspace Stash",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Elnathan Hod",
   "license": "MIT",
   "description": "Workspace-level minimize/restore: stash every window on the current workspace and restore the accumulated set with a gesture or SUPER+M.",
@@ -20,8 +20,10 @@
     "defaultSection": "left",
     "defaults": {
       "displayMode": "count",
-      "maxNames": 4,
-      "maxIcons": 6
+      "maxNames": 2,
+      "maxIcons": 3,
+      "overflowStyle": "badge",
+      "overflowCountMode": "leftover"
     },
     "schema": [
       {
@@ -39,7 +41,7 @@
         "min": 1,
         "max": 10,
         "step": 1,
-        "defaultValue": 4
+        "defaultValue": 2
       },
       {
         "key": "maxIcons",
@@ -48,7 +50,23 @@
         "min": 1,
         "max": 12,
         "step": 1,
-        "defaultValue": 6
+        "defaultValue": 3
+      },
+      {
+        "key": "overflowStyle",
+        "type": "enum",
+        "label": "Overflow style",
+        "description": "Prefix shown before the overflow count when names/icons are truncated: +N or ..N. Independent of overflowCountMode below.",
+        "options": ["badge", "ellipsis"],
+        "defaultValue": "badge"
+      },
+      {
+        "key": "overflowCountMode",
+        "type": "enum",
+        "label": "Overflow count",
+        "description": "What the overflow count means, independent of overflowStyle above. leftover shows how many are hidden; total shows the full stashed count.",
+        "options": ["leftover", "total"],
+        "defaultValue": "leftover"
       }
     ]
   }

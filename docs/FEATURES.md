@@ -4,9 +4,9 @@
 
 Target: Omarchy Quattro / Hyprland / Quickshell 
 
-Status: V1 and V2 scope locked; V3 direction reserved 
+Status: V1, V2, and V3 scope locked and implemented 
 
-Scope rule: preserve the agreed user-facing behavior first; prefer the smallest event-driven architecture that implements it correctly. Implementation details may evolve, but V1/V2 semantics in this document are the project contract. 
+Scope rule: preserve the agreed user-facing behavior first; prefer the smallest event-driven architecture that implements it correctly. Implementation details may evolve, but V1/V2/V3 semantics in this document are the project contract. 
 
 # **1. Purpose** 
 
@@ -42,7 +42,7 @@ The plugin must not overwrite user bindings automatically. Ship the binding as t
 
 ### **Bar indicator** 
 
-The plugin adds a small bar widget in the left section by default. It is visible only while a stash exists. 
+The plugin adds a small bar widget in the left section by default. It is always visible, dimmed while the stash is empty and at full opacity once it holds anything — it is the plugin's only discoverable entry point on a fresh install, since installing it never adds keybindings automatically. Left-click is state-driven the same way SUPER+M is: it stashes the current workspace when empty, restores the full stash when not. 
 
 - count: show only the number of stashed windows, e.g. “3”. 
 
@@ -206,6 +206,8 @@ Recommended default: count. It is the most stable option across icon themes, lon
 
 For names mode, use the application/class name where possible rather than full window titles. For icons mode, resolve from installed desktop entries/icon theme; do not bundle a private icon set for common applications. 
 
+V3 adds two more independent settings governing the overflow indicator shown when names/icons are truncated (see §8.2): `overflowStyle` (`badge` → `+N`, `ellipsis` → `..N`) and `overflowCountMode` (`leftover` → how many are hidden, `total` → the full stashed count). Both settings always combine into a single indicator that shows a number; neither setting is ever shown bare. Both are irrelevant, and hidden from the settings menu, while `displayMode` is `count`, since count mode never truncates. V3 also adds a "restore defaults" action resetting every bar-widget setting to its manifest default in one step. 
+
 ### **5.7 Performance rules** 
 
 - React to Hyprland/Quickshell state changes; do not poll hyprctl on an interval. 
@@ -246,7 +248,7 @@ For names mode, use the application/class name where possible rather than full w
 
 - Closed/stale clients do not break restore. 
 
-- Bar widget appears only while the stash is non-empty. 
+- Bar widget is always visible, dimmed while the stash is empty; left-click stashes when empty and restores when not, the same state-driven behavior as SUPER+M. 
 
 - count, names, and icons modes work without changing the stash logic. 
 
@@ -263,6 +265,20 @@ Workspace Stash - Feature & Implementation Specification
 - Plugin passes omarchy plugin validate. 
 
 - README documents install, enable, gesture setup, settings, limitations, and uninstall. 
+
+### **V3 additions to acceptance criteria** 
+
+- `moveTo <workspaceId>` moves every eligible window on the current workspace to the target, leaves the invoking user's focus untouched, and never reads or writes the stash. 
+
+- Moving two or more windows onto an occupied target does not collapse the target's existing window(s). 
+
+- Neither restore nor bulk workspace-move leaves the mouse cursor anywhere other than where the user left it. 
+
+- `overflowStyle` and `overflowCountMode` combine independently; every combination shows a number, never a bare prefix; the Overflow section is hidden whenever `displayMode` is `count`. 
+
+- Restore-defaults resets every bar-widget setting to its manifest default in one confirmed action. 
+
+- The keybindings panel's copy affordance and config-file-open affordance work without the plugin ever writing to the user's Hyprland configuration itself. 
 
 # **7. V2: layout-preserving restore** 
 
@@ -304,27 +320,65 @@ Workspace Stash - Feature & Implementation Specification
 
 ### **7.5 V2 safety rule** 
 
-Layout reconstruction must be best-effort, never destructive. If the inferred tree is invalid, incomplete, or incompatible with the active layout, the plugin should restore all windows normally rather than refusing to restore the stash. 
+Layout reconstruction must be best-effort, never destructive. If the inferred tree is invalid, incomplete, or incompatible with the active layout, the plugin should restore all windows normally rather than refusing to restore the stash. Concretely: for the windows a batch's ordering can't structurally place (a true multi-branch layout — see §7.3), the plugin must not force their captured size onto whatever fallback order it picks, since that reliably collapses them; those windows fall back to Hyprland's own tiling instead. This rule applies equally to bulk workspace-move (§8.1), which reuses the same ordering and geometry logic. 
 
 ### **7.6 V2 compatibility** 
 
 Do not redesign the public API for V2. The directional gestures, SUPER+M toggle semantics, global minimized-set behavior, bar modes, and plugin packaging should remain compatible with V1. Layout preservation is an internal restore enhancement. 
 
-# **8. Configuration defaults** 
+# **8. V3: bulk workspace-move, advanced settings, and discoverability** 
+
+V3 adds one new stateless operation and a richer bar-widget settings surface. It does not change the V1/V2 stash/restore contract; everything here is either orthogonal to the stash or an additive settings-menu feature. 
+
+### **8.1 Bulk workspace-move** 
+
+A separate, stateless operation: move every eligible window on the currently focused workspace to a target workspace, without following the view there and without touching the stash in any way — it never reads or writes the minimized set, `root.meta`, or the stash's special workspace. 
+
+- Published default binding: `SUPER + CTRL + SHIFT + 1` through `9`, plus `0` for workspace 10, mirroring Hyprland/Omarchy's own upstream convention of key `0` mapping to workspace 10. 
+- Exposed as one parameterized IPC method (`moveTo <workspaceId>`), not nine separate ones. 
+- Best-effort merge on an occupied target: existing windows on the destination are left undisturbed; Hyprland's own tiling absorbs the arriving windows the same way restore does today. Moving two or more windows onto an already-occupied destination must not collapse the destination's existing window(s) to a sliver — captured tiled geometry is not reapplied when the destination already holds windows, since the captured size assumes the window's original, now-invalid, tree position. 
+- Reuses V2's layout-preserving ordering logic (batch-then-position ordering, split-structure/geometry dispatch) against the target workspace as the destination, with the same best-effort/non-destructive guarantee as restore. 
+- The invoking user's own focus never moves to the target workspace, and the moved windows must not warp the mouse cursor away from wherever it currently is — Hyprland's default cursor-follows-focus behavior during the move must be explicitly compensated for. 
+- No bar-widget changes; this is a stateless, one-shot action with nothing to persist or display. 
+
+### **8.2 Advanced overflow settings** 
+
+Two settings govern the overflow indicator shown once the `names`/`icons` display mode truncates the shown set (see §5.6): `overflowStyle` chooses the prefix (`badge` → `+N`, `ellipsis` → `..N`); `overflowCountMode` chooses what `N` means (`leftover` → count of hidden items, `total` → the full stashed count). The two settings are fully independent — every combination is valid, and the indicator always shows a number, never a bare prefix. Both settings, and the section containing them, are hidden from the settings menu whenever `displayMode` is `count`, since count mode never truncates anything and the settings would have no effect. 
+
+### **8.3 Restore defaults** 
+
+The settings menu includes a single confirmed action that resets every bar-widget setting back to its manifest default, so users can freely tune display/overflow settings knowing they can always return to a known-good baseline without hunting down each setting individually. 
+
+### **8.4 Keybindings reference panel** 
+
+The settings menu includes a drill-down page listing the plugin's documented keyboard and gesture bindings, each with a copy-to-clipboard affordance, plus a button that opens the relevant Hyprland config file (`bindings.lua` for keyboard shortcuts, `input.lua` for gestures) directly in the user's editor, jumped to the relevant line where possible. This never writes to the user's configuration itself — it only opens it for the user to edit, consistent with §3's rule against silently modifying user configuration. 
+
+### **8.5 Discoverability fix (correction to the V1 bar-indicator contract)** 
+
+V1 originally hid the bar widget entirely while the stash was empty (see the superseded first paragraph of §2, now corrected). Combined with the project's rule against auto-modifying user keybindings, a fresh install had no discoverable entry point at all beyond the CLI. §2's bar-indicator behavior — always visible, dimmed while empty, left-click reusing `toggle()`'s state-driven stash/restore semantics regardless of stash state, right-click always opening settings, discoverability carried by the hover tooltip rather than a forced-open menu — is the fix, and is a correction to the V1 contract rather than new V3-only scope. The V1 acceptance criteria in §6 reflect the corrected behavior. 
+
+### **8.6 V3 compatibility** 
+
+Bulk workspace-move, the settings additions, and the discoverability fix do not change the public stash/restore API, gesture bindings, or SUPER+M toggle semantics. Bulk workspace-move is additive and fully orthogonal; the settings additions are backward-compatible schema extensions with sensible defaults; the discoverability fix only changes what was an unintentional gap in the original V1 contract. 
+
+# **9. Configuration defaults** 
 
 |keyboard toggle|SUPER+M|Empty stash: stash current<br>workspace. Non-empty stash:<br>restore all to current workspace.|
 |---|---|---|
 |Setting|Default|Notes|
 |gesture fingers|3|Documentation includes 4-finger<br>alternative.|
+|bulk workspace-move|SUPER+CTRL+SHIFT+1-9,0|0 maps to workspace 10. Orthogonal<br>to the stash; never touches it.|
 |displayMode|count|Allowed: count, names, icons.|
-|maxNames|4|Overflow should collapse to a compact<br>remainder indicator.|
-|maxIcons|6|Avoid excessive bar width.|
+|maxNames|2|Overflow collapses into the<br>configured overflow indicator.|
+|maxIcons|3|Overflow collapses into the<br>configured overflow indicator.|
+|overflowStyle|badge|Allowed: badge (+N), ellipsis (..N).|
+|overflowCountMode|leftover|Allowed: leftover, total. Independent<br>of overflowStyle.|
 |stash workspace|special:workspace-stash|Private implementation workspace.|
 |minimized set|global|Repeated swipe-downs append<br>windows; swipe-up restores all.|
 
 
 
-# **9. Release discipline** 
+# **10. Release discipline** 
 
 ### **V1** 
 
@@ -344,7 +398,15 @@ Do not redesign the public API for V2. The directional gestures, SUPER+M toggle 
 
 - Retain a safe fallback to ordinary restore. 
 
-# **10. Publishing checklist** 
+### **V3** 
+
+- Ship bulk workspace-move as its own tested operation, including an occupied-destination merge case with two or more incoming windows (the collapse regression named in §8.1). 
+
+- Ship the overflow-setting and reset-defaults additions with `omarchy plugin validate` and `qmllint` passing on every change. 
+
+- Verify the discoverability fix (§8.5) against a simulated fresh install: no bar-widget interaction and no keybindings configured beforehand. 
+
+# **11. Publishing checklist** 
 
 - Public GitHub repository. 
 
@@ -364,7 +426,7 @@ Workspace Stash - Feature & Implementation Specification
 
 - Submit the repository to omarchyplugins.com after validation. 
 
-# **11. Reference notes** 
+# **12. Reference notes** 
 
 This specification is based on the current Omarchy Quattro plugin contract and Hyprland/Quickshell integration model. Verify these contracts again before release if Omarchy or Hyprland changes materially. 
 

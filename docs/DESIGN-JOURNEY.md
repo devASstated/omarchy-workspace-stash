@@ -568,6 +568,14 @@ throughout) and accepting the boundary, the boundary was accepted, and
 documented directly in `restoreOrder()`'s and `structureClauses()`'s code
 comments rather than papered over.
 
+*Narrowed later, not overturned:* §20 below found and fixed a materially
+narrower flat-sort bug within this same boundary — the "insert as a sibling
+of an already-built pair" case was never actually reachable from a single
+lone window plus a group, since that shape *is* buildable via a linear
+chain, the old sort just didn't reliably find the right one. The true
+multi-branch case (an actual 2×2 grid, two independently-split columns)
+remains exactly as accepted here.
+
 ## 18. Correcting a keybind decision against upstream, not just the local install
 
 Switching the cumulative-stash binding from `SUPER+ALT+M` to `SUPER+CTRL+M`
@@ -617,6 +625,278 @@ layout-preserving restore:
   followed throughout, just with less friction for the user who chooses
   to do it themselves.
 
+## 20. V3: bulk workspace-move, advanced settings, and the discoverability fix
+
+All three candidates named in §19 were built, in the order the project owner
+asked for: bulk workspace-move first, as its own tested, orthogonal
+operation; the advanced settings GUI (overflow settings, restore-defaults,
+keybindings panel) second, planned as a UI pass before any QML was written.
+
+### Bulk workspace-move
+
+`restoreOrder(addresses)`'s comparator was extracted into
+`orderDescriptors(descriptors)` — a pure function over plain
+`{ address, batchId, x, y }` objects — so bulk-move could reuse the exact
+same best-effort ordering without ever touching `root.meta`, keeping the new
+operation fully orthogonal to the stash by construction, not by convention.
+`moveWorkspaceTo(targetWorkspaceId)` mirrors `stash()`'s proven two-phase
+shape: synchronous eligibility checks, a fresh `hyprctl -j clients` capture
+(never the cached Hyprland model, per priority #10), then a finish handler
+that builds structure/geometry dispatch clauses against the target
+workspace as destination and fires one atomic `hyprctl --batch` call.
+Exposed over IPC as a single parameterized `moveTo <workspaceId>` method,
+bound by default to `SUPER+CTRL+SHIFT+1-9` plus `0` for workspace 10.
+
+Testing found two real bugs, both fixed rather than merely documented,
+since both violated the project's "never destructive" bar:
+
+- **Occupied-destination collapse.** Moving two or more windows onto an
+  already-occupied target shrank the existing window there to a sliver.
+  The captured geometry assumed each window's original tree position,
+  which is no longer valid once Hyprland re-parents the arriving windows
+  into the destination's existing tree. Fixed by adding a `skipTiledResize`
+  flag to `geometryClauses()`: when the destination is occupied, tiled
+  windows skip their absolute-resize clause entirely and let Hyprland's own
+  tiling settle them, while floating-window geometry restore is unaffected.
+  `isWorkspaceOccupied()` reused live `Hyprland.toplevels` rather than a
+  fresh query, justified because occupancy of a workspace the current
+  operation hasn't itself just touched doesn't need read-time-exact data,
+  unlike geometry of windows the operation *is* moving.
+- **Cursor warp.** Restoring or bulk-moving windows visibly snapped the
+  mouse cursor to the center of the screen. Confirmed against the real
+  compositor, not assumed: `hyprctl cursorpos` before/after with zero
+  physical mouse movement showed a position change. Root cause: the
+  `hl.dsp.focus()` calls inside `structureClauses()`, needed for
+  Dwindle-ordering during restore, trigger Hyprland's default
+  cursor-follows-focus behavior, leaving the cursor wherever the last
+  structured window landed. A global `cursor:no_warps` config change was
+  rejected outright — it would silently modify the user's Hyprland config,
+  which this project has refused to do since V1. Fixed instead by
+  converting `restore()` into the same two-step async shape already used
+  elsewhere: query `hyprctl cursorpos` first, then append an explicit
+  `hl.dsp.cursor.move({x,y})` as the final clause of the same atomic batch,
+  restoring the cursor to exactly where the user left it. Applied
+  identically to bulk workspace-move's finish handler.
+
+### The discoverability flaw
+
+Once bulk-move was working, the project owner raised a real gap that had
+gone unnoticed since V1: a fresh install shows nothing in the bar (hidden
+while the stash is empty, per the original §2 contract) and configures no
+keybindings (the plugin never writes to user config), leaving no
+discoverable entry point at all besides the CLI. The first proposal
+considered — a dimmed icon that opens a menu on any click while empty — was
+rejected in favor of a simpler, more consistent design the project owner
+converged on directly: the icon is always visible, dimmed while empty and
+full-opacity once stashed; left-click always performs the state-appropriate
+action by delegating to the existing `toggle()` (stash when empty, restore
+when not — no new state machine); right-click always opens settings
+regardless of stash state; discoverability comes from the hover tooltip,
+not from forcing a menu open on an unfamiliar icon, reasoning that a user
+new to Omarchy plugins has almost certainly already hovered another bar
+widget by the time they reach this one. This is a correction to the V1
+bar-indicator contract, not new V3 scope, so §2 and §6 in `FEATURES.md`
+were updated in place rather than appended to.
+
+### The settings menu
+
+Planned visually before implementation (see the published `Stash Settings
+Menu` artifact from this phase): display-mode `ButtonGroup`, a custom
+bigger-target stepper for `maxNames`/`maxIcons` (the stock `NumberField`
+spinbox arrows were judged too small once the goal became "easier to
+click"), an Overflow section, a restore-defaults action behind a
+`ConfirmDialog`, and a keybindings drill-down page modeled on a precedent
+found in the installed `ilyazar.btop` plugin (open-file-at-line via a
+generalized `open-config-file.sh`, plus `wl-copy` for the per-binding copy
+buttons).
+
+Two rounds of live testing found real clipping bugs, both traced to the
+same root cause: `PopupCard`'s `fittedContentWidth()`/`fittedContentHeight()`
+only ever *shrink* a passed value to fit the screen, they never grow it to
+fit actual content, so every width guess has to be generous up front rather
+than tuned incrementally. The menu's `contentWidth` moved 170 → 240 (fixed
+the `ButtonGroup`/stepper clipping) → 300 (240 was still short once
+`ConfirmDialog`'s own internal `-32` reduction and its 88+88+10 button-row
+width were accounted for — the reset-confirmation Cancel button was
+rendering outside the popup to the left). A wrong copy-icon glyph
+(`⌧` instead of `⧉`) and undersized stepper buttons (20px, smaller than
+`PanelActionButton`'s own 22px default — directly contradicting "bigger,
+easier to click") were both self-caught on review before either reached
+the user.
+
+### The glyph
+
+Iterated furthest of anything in this phase. Starting point was V1's
+bordered-box icon; the project owner wanted something that borrowed
+`git stash`'s own stack mental model while reading leaner. Candidates
+(published as the `Stash Glyph Candidates` artifact, updated across several
+rounds) moved from a layered stack/archive-box/tray-with-arrow set, to
+straight-vertical vs. leaning-diagonal line-stacks, to a vertical-bars
+variant tried for comparison — converging on a leaning stack of three thin
+horizontal bars. Two further rounds of live-testing feedback refined it: the
+bars became thinner and longer at first ("more like a dash, stacked"), then
+— after seeing it live — the whole glyph was asked to read as *less*
+attention-grabbing: shrunk from 19×10 to 12×7 space-units, bars thinned and
+shortened further, and corner radius dropped to 0 so the bars read as sharp
+dashes rather than rounded pills.
+
+### Overflow indicator: getting the design wrong once, then right
+
+The most notable design correction of this phase. Reading back the
+project owner's V2-era note behind §19's "advanced overflow settings" idea,
+the ellipsis style was implemented as returning a bare `…` character with
+no trailing number, and the leftover/total mode selector was hidden
+whenever ellipsis style was active — reasoned (wrongly) as "an ellipsis
+carries no count to choose a mode for." An `AskUserQuestion` sent to
+clarify this was explicitly declined; the project owner corrected the
+design directly instead: overflow style (prefix: `+N` or an ellipsis form)
+and overflow count mode (leftover vs. total) are **fully independent** —
+every combination is valid, and both styles always show a number. Fixed by
+rewriting `overflowIndicatorFor()` to combine an independent prefix and
+count unconditionally, and by removing the incorrect conditional that hid
+the count-mode selector under ellipsis style — keeping only the separate,
+undisputed rule that the whole Overflow section hides when `displayMode` is
+`count`, since count mode never truncates anything. `manifest.json`'s
+schema descriptions, which had encoded the wrong non-orthogonal semantics,
+were corrected to match. One further readability pass changed the ellipsis
+glyph itself from the unicode `…` to a literal `..`, and then again to `..N`
+as the button-group label text, on the reasoning that a smaller, plainer
+mark reads faster at bar-widget scale than a single unicode character most
+users won't immediately parse as "three dots."
+
+Defaults were also retuned during this phase, independent of any bug: after
+living with the widget for a while, `maxNames`/`maxIcons` moved from V1's
+4/6 down to 2/3 — a tighter, less bar-space-hungry default now that the
+overflow indicator reliably communicates what's hidden.
+
+### A real restore bug found after V3 felt done: the flat sort's blind spot
+
+Reported live, with an exact repro: tile three windows so one occupies a
+full-height half and the other two share the remaining half stacked evenly;
+swapping between the two stacked windows via `SUPER`+drag survives
+stash/restore fine, but dragging one of them onto the half-height window —
+re-tiling it to nest there, so the vacated side collapses to the third
+window alone — makes restore squeeze one window down to a handful of
+pixels. Traced to code, then reproduced directly against the compositor
+before touching anything, per this project's standing rule of confirming
+against a real Hyprland session rather than reasoning it through alone:
+building the exact post-drag geometry and stash/restoring it collapsed a
+418px-tall window to 34px, matching the report exactly.
+
+Root cause: `orderDescriptors()`'s flat sort (batch, then row-tolerant y,
+then x) doesn't know which windows are actually siblings in the tree — it
+only sees absolute position. For this shape, the lone window and the *top*
+window of the stacked pair often land in the same "row" by y-tolerance and
+get sorted ahead of the pair's *bottom* window, producing an insertion
+order that builds the wrong tree (`lone | (top | bottom)` instead of the
+real `(top / bottom) | lone`) even though the real tree — like every tree
+`structureClauses()` can build — is a "caterpillar": each split has exactly
+one leaf on one side, because each insert can only ever split whichever
+single window was most recently placed and focused. That's a materially
+narrower, more tractable problem than the true split-tree inference
+`FEATURES.md` §7.3-7.4 and §17 above already ruled out: not "infer the
+whole tree from geometry," just "find the one linear order that reproduces
+a caterpillar, when the layout is one."
+
+The fix keeps that same "smallest lightweight" discipline: `peelOrder()`
+repeatedly finds a window in the remaining set that's separated from every
+other remaining window by a single full-span vertical or horizontal line
+(`isSeparated()`, reusing the existing `rowTolerance` slack for tab-bar/
+chrome offsets) and peels it off next, outermost first — exactly the
+insertion order a caterpillar tree needs. `orderDescriptors()` runs this
+per batch, oldest batch first, same as before. The moment no separable
+window remains, whatever's left falls back to the original row/x sort
+unchanged — the true multi-branch case from §17 (an actual 2×2 grid) isn't
+a caterpillar, still isn't attempted, and is left exactly as accepted
+there; nothing about that boundary moved.
+
+Verified against both repro orientations (lone window left of the pair,
+and mirrored right of it — only the second one exposed the bug, which is
+why a single repro isn't enough evidence in this codebase) and the full
+regression suite for both `restore()` and `moveWorkspaceTo()` — all cases
+passed, including one that had been a documented `CHECK`/drift result
+before this fix (a repeated stash/restore cycle test) and now passes
+outright, an unplanned side benefit of ordering being derived from actual
+geometry instead of a proxy for it.
+
+### Follow-up: the fix removed the collapse, but the layout still didn't match
+
+Reported immediately after the above: the previously-thinned window no
+longer collapsed, but restoring the same shape still didn't reproduce the
+*original* layout — the lone window and the stacked pair could come back
+swapped to the opposite side (still a valid caterpillar tree, still correct
+sizes, just mirrored). `peelOrder()` fixes which windows end up siblings and
+how big they are, but `structureClauses()` never told Dwindle *which side*
+of the active window a new insertion should land on — that's Dwindle's own
+default heuristic, unrelated to the captured layout.
+
+Checked the Lua dispatcher stub (`/usr/share/hypr/stubs/hl.meta.lua`) for a
+way to control this before assuming one didn't exist, per this project's
+"inspect before guessing" habit (§1). Found `hl.dsp.layout(...)` — the Lua
+binding for Hyprland's `layoutmsg` dispatcher — and confirmed live, not
+just from the stub signature, that `hl.dsp.layout("preselect l|r|u|d")`
+deterministically controls which side the *next* inserted window lands on
+relative to the currently focused one.
+
+Since `structureClauses()` already focuses each window right after placing
+it (needed for the split-chain itself, see above), the "currently focused"
+window at each step is always the immediately-previous window in the
+resolved order — so comparing each window's captured position to that one
+specific predecessor's captured position (`preselectDirection()`, larger
+axis offset wins, same convention `isSeparated()` already uses) gives
+exactly the right direction, with no new data needed beyond what was
+already captured. One `preselect` clause was added immediately before each
+non-first window's `move`/`focus` pair, in both `finishRestore()` and
+`finishMoveWorkspace()`.
+
+Verified against the exact repro that exposed the mirroring: before and
+after snapshots are now identical byte-for-byte, not just matching on
+topology and size. Full regression suite (23 cases across both suites)
+still passes.
+
+### Second follow-up: a true grid, reached without any dragging at all
+
+Reported next, with a precise repro: three terminals tiled naturally into
+`t1 | (t2 | t3)`, then a fourth window (Spotify, in the real report) opened
+specifically inside `t1` — the single largest half — splitting it into its
+own pair while the other half already held its own two-window group.
+Rebuilt the exact shape with test windows first, since the earlier
+mirroring bug had already shown a single repro orientation isn't always
+enough evidence here: confirmed `t2`/`t3` collapsed to 20-26px slivers on
+restore, matching the report.
+
+Checked this against `isSeparated()` directly rather than assuming: no
+window in `{t1, t2, t3, t4}` is separable from the other three by any
+single full-span line, because each one always has both a same-row and a
+same-column neighbor among the rest. That's the true multi-branch case —
+`(t1/t4) | (t2/t3)`, two independently-split branches — `peelOrder()`
+already correctly declines to guess an order for, per §17's accepted
+boundary. The collapse wasn't from a wrong order, though; it was from
+`geometryClauses()` still forcing the *original captured sizes* onto
+whatever fallback order `peelOrder()` produced, sizes which no longer add
+up once the real tree doesn't match that order.
+
+Rather than attempt the multi-branch inference §17 already ruled out
+(raised in conversation first, per `docs/CLAUDE.md`), `peelOrder()` was
+changed to report which windows it couldn't place — the leftover set from
+a stalled peel — as `unresolved`, alongside its (still best-effort) order.
+`geometryClauses()`'s existing `skipTiledResize` flag, already used for the
+occupied-destination case, now also covers any address in `unresolved`:
+those specific windows skip absolute resize and get whatever Hyprland's
+own tiling produces instead, rather than a captured size fighting a tree
+it no longer belongs to. This doesn't reconstruct the grid — that boundary
+is unchanged — it just replaces a collapse with an ordinary, if imprecise,
+tiled layout, in keeping with §7.5's existing "best-effort, never
+destructive" rule.
+
+Verified against the exact repro: the same four windows now come back at
+163-346px instead of 20-26px — not evenly split, since Hyprland's own
+insertion heuristic (not this plugin) decides the actual sizes once
+resize is skipped, but no longer a near-invisible sliver. Full regression
+suite still passes, including a direct re-check that the previous
+mirroring fix (a real caterpillar, not a grid) still restores
+byte-for-byte identical — confirming the two fixes don't interfere.
+
 ## Status at the end of this document
 
 V1's full scope and V2's layout-preserving restore — batch-ordered tiled
@@ -625,14 +905,51 @@ clamping, and split-ratio preservation — are implemented and verified
 against a real Hyprland session, including edge cases (Hyprland groups,
 shell restarts, rapid repeated cycling, external-focus collisions) beyond
 what either `FEATURES.md` release-discipline checklist enumerates by name.
-One limitation is accepted and documented rather than fixed: layouts where
-a window is inserted beside an already-built group of windows, not the
-single most-recently-placed one — a 2×2 grid is the clearest example —
-aren't reliably reconstructed, because that requires the full split-tree
-inference `FEATURES.md` §7.4 already named as hard and this project chose
-not to build. `LICENSE` and this document are current; `README.md` was
-written alongside this update. The plugin id remains the placeholder
-`io.github.REPLACE_ME.workspace-stash`, pending a real GitHub namespace
-before publishing. Three ideas raised during V2 — bulk workspace-move,
-advanced overflow settings, and a keybindings reference panel — are
-captured in §19 as V3 candidates, not started.
+One limitation is accepted and documented rather than fixed: a genuinely
+multi-branch layout — an actual 2×2 grid, two independently-split columns —
+isn't reliably reconstructed, because building it requires the full
+split-tree inference `FEATURES.md` §7.4 already named as hard and this
+project chose not to build. A materially narrower case that looked similar
+at first — a lone window plus a stacked pair, reachable in one drag — turned
+out to be fully fixable within the "smallest lightweight" discipline instead
+of falling into that same bucket; see §20's ordering-bug entry for why the
+two aren't actually the same problem. The true grid case that remains isn't
+fully unaddressed either: it no longer collapses windows to slivers, since
+`peelOrder()`'s `unresolved` set now tells `geometryClauses()` to skip
+forcing a stale captured size on exactly the windows it couldn't place —
+still not the original layout, but no longer a destructive-looking failure.
+The plugin id was set to `io.github.devASstated.workspace-stash`, replacing
+the earlier `io.github.REPLACE_ME.workspace-stash` placeholder.
+
+All three V3 candidates named in §19 are implemented and verified as of
+§20: bulk workspace-move (`SUPER+CTRL+SHIFT+1-9,0`), fully orthogonal to the
+stash and tested against an occupied-target collapse regression and a
+cursor-warp regression, both found live and fixed rather than documented as
+accepted; the advanced settings menu, with independent overflow-style/
+overflow-count-mode settings, a confirmed restore-defaults action, and a
+keybindings reference panel that copies snippets and opens the relevant
+Hyprland config file without ever writing to it; and a correction to the
+V1 bar-indicator contract itself — the bar widget is now always visible
+(dimmed while empty), left-click delegates to the existing `toggle()`
+regardless of stash state, and right-click always opens settings, closing
+the discoverability gap a fresh install used to have. The bar icon went
+through two redesign passes this project: from V1's bordered box to a
+leaning three-bar stack (closer to `git stash`'s own mental model), then
+thinned, shortened, and sharpened into its current less attention-grabbing
+form. Three more unplanned fixes landed after the above felt done, all from
+live user reports: the ordering bug detailed above narrows what §17's
+accepted layout-reconstruction limitation actually covers, fixing a common
+real-world case (one window alone, a stacked pair on the other side) that
+used to collapse a window on restore; a follow-up preselect fix makes the
+*side* each window lands on (not just its size and which windows are
+siblings) match the original layout too, for any layout reconstructable
+this way — confirmed byte-for-byte identical against the exact repro that
+first exposed the mirroring; and a third fix gives the still-accepted true
+grid case a safety net, so a batch `peelOrder()` can't resolve now falls
+back to natural Hyprland sizing instead of collapsing windows to slivers.
+`restoreOrder()`'s and `moveWorkspaceTo()`'s ordering both go through the
+same `peelOrder()`/`isSeparated()`/`preselectDirection()` logic, and both
+now thread `peelOrder()`'s `unresolved` set into `geometryClauses()`.
+`LICENSE`, `README.md`, and `FEATURES.md` are current as of this update; `FEATURES.md`
+§8 now documents V3 as locked project contract rather than reserved
+direction.

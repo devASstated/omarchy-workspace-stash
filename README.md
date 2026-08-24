@@ -26,12 +26,21 @@ restoring their original layout on a best-effort basis.
   were captured on
 - Guards against Hyprland's own external-focus behavior ever revealing the
   private stash workspace as an unintended scratchpad
+- Bulk workspace-move: send every window on the current workspace to another
+  one, best-effort layout preserved, without following it there and without
+  touching the stash at all
 - A bar widget shows the stash as a count, application names, or icons, with
-  a right-click menu for display settings
+  a right-click menu for display settings, overflow-indicator settings, a
+  one-click restore-defaults action, and a keybindings reference panel
+- The bar widget is always visible — dimmed while the stash is empty, full
+  opacity once it holds anything — so there's a discoverable entry point
+  even before any keybinding is set up
 - Tracks state reactively through Hyprland's live window model — no polling,
   no background daemon, no persisted state
 - Reconstructs correctly after a Quickshell shell restart, purely by
   re-reading Hyprland
+- Never moves the mouse cursor as a side effect of restoring or moving
+  windows
 
 ## Requirements
 
@@ -45,14 +54,14 @@ Review the source before installing. Omarchy plugins run as unsandboxed code
 inside the long-running shell process.
 
 ```bash
-omarchy plugin add https://github.com/REPLACE_ME/omarchy-workspace-stash.git --enable
+omarchy plugin add https://github.com/devASstated/omarchy-workspace-stash.git --enable
 ```
 
 The widget defaults to the left bar section. If you installed it without
 `--enable`, enable it later with:
 
 ```bash
-omarchy plugin enable io.github.REPLACE_ME.workspace-stash --section left
+omarchy plugin enable io.github.devASstated.workspace-stash --section left
 ```
 
 ### Gestures
@@ -108,7 +117,25 @@ hl.bind(
 )
 ```
 
-Before adding either, confirm the key isn't already assigned:
+Bulk workspace-move is a separate, stateless operation — it never reads or
+writes the stash. It moves every eligible window on the current workspace to
+a target workspace, best-effort layout preserved, without following the view
+there. The published default is `SUPER + CTRL + SHIFT + 1` through `9`, plus
+`0` for workspace 10:
+
+```lua
+-- Add to ~/.config/hypr/bindings.lua
+for workspace = 1, 10 do
+  local key = "code:" .. tostring(workspace + 9)
+  hl.bind(
+    "SUPER + CTRL + SHIFT + " .. key,
+    hl.dsp.exec_cmd("omarchy-shell -q workspace-stash moveTo " .. tostring(workspace)),
+    { description = "Move workspace to workspace " .. workspace }
+  )
+end
+```
+
+Before adding any of these, confirm the keys aren't already assigned:
 
 ```bash
 omarchy menu keybindings --print
@@ -132,32 +159,45 @@ of the above.
 | 3-finger swipe down (or `SUPER+CTRL+M`) | Stash the current workspace, adding to any existing stash |
 | 3-finger swipe up (or `SUPER+M` with a non-empty stash) | Restore the entire stash onto the current workspace |
 | `SUPER+M` with an empty stash | Stash the current workspace |
-| Left-click the bar widget | Restore the entire stash |
-| Right-click the bar widget | Open the display-style menu |
+| `SUPER+CTRL+SHIFT+1-9,0` | Move every window on the current workspace to workspace 1-10 (never touches the stash) |
+| Left-click the bar widget | Stash the current workspace if the stash is empty, restore it otherwise — same as `SUPER+M` |
+| Right-click the bar widget | Open the settings menu |
 
-The bar widget is visible only while the stash is non-empty.
+The bar widget is always visible: dimmed while the stash is empty, full
+opacity once it holds anything, so there's always a discoverable way to use
+the plugin even before any keybinding is set up.
 
 ### Configuration
 
-Right-click the bar widget to change display style (count / names / icons)
-and the name/icon overflow limits, or set them from the command line:
+Right-click the bar widget to open the settings menu: display style (count /
+names / icons), name/icon overflow limits, the overflow indicator's style
+and count mode, a restore-defaults action, and a keybindings reference page
+with copy-to-clipboard and open-config-file buttons. Settings can also be set
+from the command line:
 
 ```bash
-omarchy bar set io.github.REPLACE_ME.workspace-stash displayMode names
-omarchy bar set io.github.REPLACE_ME.workspace-stash maxNames 6
-omarchy bar set io.github.REPLACE_ME.workspace-stash maxIcons 8
+omarchy bar set io.github.devASstated.workspace-stash displayMode names
+omarchy bar set io.github.devASstated.workspace-stash maxNames 6
+omarchy bar set io.github.devASstated.workspace-stash maxIcons 8
+omarchy bar set io.github.devASstated.workspace-stash overflowStyle ellipsis
+omarchy bar set io.github.devASstated.workspace-stash overflowCountMode total
 ```
 
 | Setting | Default | Notes |
 | --- | --- | --- |
 | `displayMode` | `count` | `count`, `names`, or `icons`. `count` is the most stable option across icon themes, long application names, and narrow bars. |
-| `maxNames` | `4` | Names beyond this collapse into a `+N` indicator. |
-| `maxIcons` | `6` | Icons beyond this collapse into a `+N` indicator. |
+| `maxNames` | `2` | Names beyond this collapse into the overflow indicator below. |
+| `maxIcons` | `3` | Icons beyond this collapse into the overflow indicator below. |
+| `overflowStyle` | `badge` | `badge` (`+N`) or `ellipsis` (`..N`). Independent of `overflowCountMode`. Not shown when `displayMode` is `count`. |
+| `overflowCountMode` | `leftover` | `leftover` (how many are hidden) or `total` (the full stashed count). Independent of `overflowStyle`. Not shown when `displayMode` is `count`. |
+
+The settings menu's restore-defaults action resets all of the above back to
+these defaults in one confirmed step.
 
 ## Update
 
 ```bash
-omarchy plugin update io.github.REPLACE_ME.workspace-stash
+omarchy plugin update io.github.devASstated.workspace-stash
 ```
 
 ## Remove
@@ -165,7 +205,7 @@ omarchy plugin update io.github.REPLACE_ME.workspace-stash
 Restore your stash before removing the plugin, then run:
 
 ```bash
-omarchy plugin remove io.github.REPLACE_ME.workspace-stash
+omarchy plugin remove io.github.devASstated.workspace-stash
 ```
 
 Removing the plugin does not close or move stashed windows out of the
@@ -181,15 +221,15 @@ again the same way.
 
 ## Limitations
 
-- **Layout restoration is best-effort, not exact**, for tiled windows.
-  Simple layouts — a straight sequence of splits, the common case — restore
-  reliably, including split ratios. Layouts where a window needs to be
-  inserted beside an *already-built group* of windows rather than the single
-  most recently placed one (a true 2×2 grid is the clearest example) aren't
-  reliably reconstructed: Hyprland may fall back to tiling those windows in
-  a different arrangement. Nothing is lost or hidden in this case — every
-  window still comes back — only its exact position/size may differ from
-  where it was.
+- **Layout restoration is best-effort, not exact**, for tiled windows. Any
+  layout buildable one window at a time — a straight sequence of splits, or
+  a lone window alongside a stacked/grouped set, however many windows deep —
+  restores reliably, including split ratios. A genuinely multi-branch
+  layout, where two *independently*-split groups sit side by side (a true
+  2×2 grid is the clearest example), isn't reliably reconstructed: Hyprland
+  may fall back to tiling those windows in a different arrangement. Nothing
+  is lost or hidden in this case — every window still comes back — only its
+  exact position/size may differ from where it was.
 - **The stash is global**, not per-workspace. Repeated stash gestures from
   different workspaces accumulate into the same stash; there's no way to
   restore only one previous stash operation.

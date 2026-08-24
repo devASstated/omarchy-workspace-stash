@@ -57,6 +57,34 @@ hl.bind(
 )
 
 -- ---------------------------------------------------------------------------
+-- Optional: bulk workspace-move — SUPER + CTRL + SHIFT + 1-9, 0 for 10
+--
+-- Moves every eligible window on the current workspace onto workspace N,
+-- preserving their layout best-effort, and leaves you exactly where you
+-- were — it never switches your view there. This is a separate operation
+-- from the stash above: it never reads or restores the stash, and it never
+-- touches special:workspace-stash. If workspace N already has windows, the
+-- moved set merges in normally rather than replacing anything.
+--
+-- Same conflict caveat as the bindings above: check
+-- `omarchy menu keybindings --print` first. SUPER+CTRL+SHIFT+<digit> was
+-- chosen after confirming every other 2- and 3-modifier digit combo
+-- (SUPER+<digit>, SUPER+SHIFT+<digit>, SUPER+ALT+<digit>,
+-- SUPER+SHIFT+ALT+<digit>, SUPER+CTRL+<digit>) is already claimed by an
+-- Omarchy default. Uses `code:` key names the same way Omarchy's own
+-- workspace bindings do, so key 0 maps to workspace 10.
+-- ---------------------------------------------------------------------------
+
+for workspace = 1, 10 do
+  local key = "code:" .. tostring(workspace + 9)
+  hl.bind(
+    "SUPER + CTRL + SHIFT + " .. key,
+    hl.dsp.exec_cmd("omarchy-shell -q workspace-stash moveTo " .. tostring(workspace)),
+    { description = "Move workspace to workspace " .. workspace }
+  )
+end
+
+-- ---------------------------------------------------------------------------
 -- Gestures — published default: 3 fingers
 --
 -- IMPORTANT: check ~/.config/hypr/input.lua for an existing 3-finger
