@@ -9,7 +9,7 @@ set -euo pipefail
 
 target_file="${1:?usage: open-config-file.sh <file> <search-pattern> [app-id]}"
 search_pattern="${2:?usage: open-config-file.sh <file> <search-pattern> [app-id]}"
-app_id="${3:-io.github.devASstated.workspace-stash-config}"
+app_id="${3:-io.github.devasstated.workspace-stash-config}"
 target_line=1
 
 if [[ -r $target_file ]]; then

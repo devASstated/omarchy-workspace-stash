@@ -7,10 +7,10 @@ import qs.Commons
 // this widget never keeps its own copy of the stashed-window list.
 BarWidget {
   id: root
-  moduleName: "io.github.devASstated.workspace-stash"
+  moduleName: "io.github.devasstated.workspace-stash"
 
   readonly property var service: (root.bar && root.bar.shell)
-    ? root.bar.shell.serviceFor("io.github.devASstated.workspace-stash") : null
+    ? root.bar.shell.serviceFor("io.github.devasstated.workspace-stash") : null
   readonly property var items: service ? service.items : []
   readonly property int count: service ? service.count : 0
   readonly property bool hasStash: count > 0
@@ -178,12 +178,12 @@ BarWidget {
   function openBindingsFile() {
     Quickshell.execDetached(["bash", root.openScript,
       Quickshell.env("HOME") + "/.config/hypr/bindings.lua", "workspace-stash",
-      "io.github.devASstated.workspace-stash-bindings"])
+      "io.github.devasstated.workspace-stash-bindings"])
   }
   function openInputFile() {
     Quickshell.execDetached(["bash", root.openScript,
       Quickshell.env("HOME") + "/.config/hypr/input.lua", "workspace-stash",
-      "io.github.devASstated.workspace-stash-input"])
+      "io.github.devasstated.workspace-stash-input"])
   }
 
   // Exact text of examples/bindings.lua's own blocks — kept in sync by

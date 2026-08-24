@@ -65,7 +65,7 @@ The widget defaults to the left bar section. If you installed it without
 `--enable`, enable it later with:
 
 ```bash
-omarchy plugin enable io.github.devASstated.workspace-stash --section left
+omarchy plugin enable io.github.devasstated.workspace-stash --section left
 ```
 
 ### Gestures
@@ -185,11 +185,11 @@ with copy-to-clipboard and open-config-file buttons.
 Settings can also be set from the command line:
 
 ```bash
-omarchy bar set io.github.devASstated.workspace-stash displayMode names
-omarchy bar set io.github.devASstated.workspace-stash maxNames 6
-omarchy bar set io.github.devASstated.workspace-stash maxIcons 8
-omarchy bar set io.github.devASstated.workspace-stash overflowStyle ellipsis
-omarchy bar set io.github.devASstated.workspace-stash overflowCountMode total
+omarchy bar set io.github.devasstated.workspace-stash displayMode names
+omarchy bar set io.github.devasstated.workspace-stash maxNames 6
+omarchy bar set io.github.devasstated.workspace-stash maxIcons 8
+omarchy bar set io.github.devasstated.workspace-stash overflowStyle ellipsis
+omarchy bar set io.github.devasstated.workspace-stash overflowCountMode total
 ```
 
 | Setting | Default | Notes |
@@ -206,7 +206,7 @@ these defaults in one confirmed step.
 ## Update
 
 ```bash
-omarchy plugin update io.github.devASstated.workspace-stash
+omarchy plugin update io.github.devasstated.workspace-stash
 ```
 
 ## Remove
@@ -214,7 +214,7 @@ omarchy plugin update io.github.devASstated.workspace-stash
 Restore your stash before removing the plugin, then run:
 
 ```bash
-omarchy plugin remove io.github.devASstated.workspace-stash
+omarchy plugin remove io.github.devasstated.workspace-stash
 ```
 
 Removing the plugin does not close or move stashed windows out of the

@@ -918,7 +918,7 @@ fully unaddressed either: it no longer collapses windows to slivers, since
 `peelOrder()`'s `unresolved` set now tells `geometryClauses()` to skip
 forcing a stale captured size on exactly the windows it couldn't place —
 still not the original layout, but no longer a destructive-looking failure.
-The plugin id was set to `io.github.devASstated.workspace-stash`, replacing
+The plugin id was set to `io.github.devasstated.workspace-stash`, replacing
 the earlier `io.github.REPLACE_ME.workspace-stash` placeholder.
 
 All three V3 candidates named in §19 are implemented and verified as of
