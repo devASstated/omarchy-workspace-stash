@@ -12,6 +12,8 @@ implements it by parking windows on a private `special:workspace-stash`
 workspace, using their exact Hyprland addresses to bring them back, and
 restoring their original layout on a best-effort basis.
 
+![Workspace Stash bar widget in count, names, and icons mode, plus the dimmed empty state](preview.png)
+
 ## Features
 
 - Stashes every eligible window on the current workspace with one gesture or
@@ -172,8 +174,13 @@ the plugin even before any keybinding is set up.
 Right-click the bar widget to open the settings menu: display style (count /
 names / icons), name/icon overflow limits, the overflow indicator's style
 and count mode, a restore-defaults action, and a keybindings reference page
-with copy-to-clipboard and open-config-file buttons. Settings can also be set
-from the command line:
+with copy-to-clipboard and open-config-file buttons.
+
+![Workspace Stash settings menu](assets/settings-menu.png)
+
+![Keybindings reference page with copy-to-clipboard buttons](assets/keybindings.png)
+
+Settings can also be set from the command line:
 
 ```bash
 omarchy bar set io.github.devASstated.workspace-stash displayMode names
