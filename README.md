@@ -49,6 +49,8 @@ restoring their original layout on a best-effort basis.
 - Omarchy with the Quattro shell plugin system
 - Hyprland running in Lua configuration mode
 - Quickshell (bundled with Omarchy Quattro)
+- `wl-clipboard`, part of Omarchy's base install — used by the settings
+  menu's keybindings page to copy a binding snippet to the clipboard
 
 ## Install
 
