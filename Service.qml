@@ -614,10 +614,14 @@ Item {
   // `occupied || unresolved[address]` decision, just as a function so the
   // caller can vary it per address if needed. `incomingMeta`/
   // `incomingAddress` are the cross-batch anchor (see finishRestore()) —
-  // null for the very first batch. Returns { structure, geometry,
-  // lastMeta, lastAddress } — the last two are the outgoing anchor for
-  // whatever batch comes next.
-  function walkAndDispatch(tree, destination, monitor, skipTiledResizeFor, incomingMeta, incomingAddress) {
+  // null for the very first batch. `metaMap` defaults to `root.meta` when
+  // omitted (every existing call site) — moveWorkspaceTo()'s extension
+  // passes its own local, immutable source-snapshot map instead, since it
+  // deliberately never reads or writes root.meta (see finishMoveWorkspace()
+  // below). Returns { structure, geometry, lastMeta, lastAddress } — the
+  // last two are the outgoing anchor for whatever batch comes next.
+  function walkAndDispatch(tree, destination, monitor, skipTiledResizeFor, incomingMeta, incomingAddress, metaMap) {
+    var meta = metaMap || root.meta
     var structure = []
     var geometry = []
     var lastMeta = incomingMeta
@@ -626,7 +630,7 @@ Item {
     function dispatchOne(leafNode, focusAddress, focusMeta) {
       var address = root.resolveLiveAddress(leafNode)
       if (!address) return
-      var m = root.meta[address]
+      var m = meta[address]
       structure = structure.concat(root.structureClauses(address, destination, m, focusMeta, focusAddress))
       geometry = geometry.concat(root.geometryClauses(address, m, monitor, skipTiledResizeFor(address)))
       if (m && !m.floating) { lastMeta = m; lastAddress = address }
@@ -637,7 +641,7 @@ Item {
       var repA = root.representativeOfNode(node.first)
       var repB = root.representativeOfNode(node.second)
       var addrA = root.resolveLiveAddress(repA)
-      dispatchOne(repB, addrA, addrA ? root.meta[addrA] : null)
+      dispatchOne(repB, addrA, addrA ? meta[addrA] : null)
       expand(node.first)
       expand(node.second)
     }
@@ -723,12 +727,33 @@ Item {
   // Kicks off D's destructive decomposition for one batch's tiled,
   // group-collapsed representative addresses — the moves themselves ARE
   // the stash (confirmed live in the seam integration test: not a probe
-  // followed by a separate stash pass).
-  function beginDecomposition(batchId, sourceWorkspace, addresses, groupMembersByAddress) {
+  // followed by a separate stash pass). Every destructive per-step move
+  // (and the final survivor move) always transits through
+  // root.stashWorkspace, regardless of caller — confirmed live this has
+  // to stay true even for moveWorkspaceTo()'s extension below: redispatching
+  // the tree-replay's move/focus/preselect sequence against windows already
+  // sitting on the *real* final destination does not reproduce the same
+  // Dwindle insertion behavior (it was tried directly at first and
+  // reliably scrambled left/right order — see
+  // docs/D-MOVE-IMPLEMENTATION-PLAN.md). `destinationWorkspace` here is
+  // therefore NOT where decomposition's own moves land — it's purely the
+  // real final target, read back only by finishMoveDecomposition() to
+  // chain one genuine cross-workspace replay (root.stashWorkspace ->
+  // destinationWorkspace) once decomposition has finished, exactly
+  // mirroring how restore() replays out of the stash onto wherever the
+  // user's focused workspace is. For stash() itself, destinationWorkspace
+  // is simply root.stashWorkspace again (a no-op distinction) since
+  // there's no separate replay — the batch just stays parked until a
+  // later, independent restore() call. `extra` is merged into the pending
+  // state and read back by completeDecomposition() to decide what happens
+  // once reconstruction finishes — defaults to the stash's own persistent
+  // batchPlans bookkeeping when omitted.
+  function beginDecomposition(batchId, sourceWorkspace, addresses, groupMembersByAddress, destinationWorkspace, extra) {
     root.decompositionInFlight = true
-    root.pendingDecomposition = {
+    var state = {
       batchId: batchId,
       sourceWorkspace: sourceWorkspace,
+      destinationWorkspace: destinationWorkspace,
       addresses: addresses,
       groupMembersByAddress: groupMembersByAddress,
       removalOrder: root.partitionRemovalOrder(addresses),
@@ -737,8 +762,11 @@ Item {
       record: [],
       beforeRects: null,
       pendingRemoval: "",
-      phase: "before"
+      phase: "before",
+      purpose: "stash"
     }
+    if (extra) for (var k in extra) state[k] = extra[k]
+    root.pendingDecomposition = state
     decomposeCaptureProcess.running = true
   }
 
@@ -857,17 +885,24 @@ Item {
     root.completeDecomposition()
   }
 
+  // Branches on st.purpose with an explicit whitelist, not an implicit
+  // truthy check — a missing or unrecognized purpose falls back to today's
+  // stash behavior rather than silently taking whichever branch happens to
+  // come first (GPT review amendment).
   function completeDecomposition() {
     var st = root.pendingDecomposition
     var result = root.reconstructTree(st.record, st.addresses, st.groupMembersByAddress)
-    var plan = { tree: null, unresolved: true }
-    if (result.tree && root.validateTree(result.tree, st.addresses)) {
-      plan = { tree: result.tree, unresolved: false }
+    var resolved = !!(result.tree && root.validateTree(result.tree, st.addresses))
+
+    if (st.purpose === "move") {
+      root.finishMoveDecomposition(st, resolved ? result.tree : null)
+    } else {
+      var plan = resolved ? { tree: result.tree, unresolved: false } : { tree: null, unresolved: true }
+      var nextPlans = {}
+      for (var b in root.batchPlans) nextPlans[b] = root.batchPlans[b]
+      nextPlans[st.batchId] = plan
+      root.batchPlans = nextPlans
     }
-    var nextPlans = {}
-    for (var b in root.batchPlans) nextPlans[b] = root.batchPlans[b]
-    nextPlans[st.batchId] = plan
-    root.batchPlans = nextPlans
 
     root.pendingDecomposition = null
     root.decompositionInFlight = false
@@ -989,7 +1024,7 @@ Item {
       return
     }
 
-    root.beginDecomposition(root.pendingStashBatchId, root.pendingStashWorkspace, representatives, grouped.representativeOf)
+    root.beginDecomposition(root.pendingStashBatchId, root.pendingStashWorkspace, representatives, grouped.representativeOf, root.stashWorkspace)
   }
 
   // Whether any live toplevel is already on `workspaceName` — read from the
@@ -1178,13 +1213,28 @@ Item {
 
   // Bulk workspace-move: relocate every eligible window on the current
   // workspace onto workspace `targetWorkspaceId`, preserving layout
-  // best-effort, without following focus there. Deliberately orthogonal to
-  // the stash — never reads or writes root.meta, never touches
-  // stashWorkspace, and runs through its own capture Process rather than
-  // stashCaptureProcess, so a stash and a bulk-move triggered close
-  // together can never cross wires. Same reasoning as stash() for reading
-  // eligibility/geometry from a fresh hyprctl query rather than
-  // Hyprland.toplevels — see finishStash() above.
+  // best-effort, without following focus there. Still deliberately
+  // orthogonal to the stash in every way that matters to the user or to
+  // this file's own bookkeeping: never reads or writes root.meta, never
+  // stores anything in root.batchPlans, and runs through its own capture
+  // Process rather than stashCaptureProcess, so a stash and a bulk-move
+  // triggered close together can never cross wires or contend over the
+  // same persistent state. One exception, internal only: 2+ tiled group
+  // representatives share the exact same decomposition sequencer stash()
+  // uses (root.pendingDecomposition, root.decompositionInFlight), which
+  // transits through root.stashWorkspace exactly like a real stash does —
+  // confirmed live this is load-bearing, not incidental: replaying the
+  // reconstructed tree directly against windows already sitting on the
+  // real final destination (skipping the stash detour) reliably scrambled
+  // left/right order, since Hyprland's insertion behavior for "already on
+  // this workspace, just re-preselect-and-move" isn't the same as a
+  // genuine cross-workspace arrival — see
+  // docs/D-MOVE-IMPLEMENTATION-PLAN.md. The transit is momentary and
+  // invisible to the user (never left there, completes within this same
+  // call), and only ever touches this specific move's own addresses on
+  // the way back out, so it coexists safely with an unrelated real stash
+  // that might already be parked there. See
+  // finishMoveWorkspace()/finishMoveDecomposition() below.
   function moveWorkspaceTo(targetWorkspaceId) {
     var workspace = Hyprland.focusedWorkspace
     if (!workspace || String(workspace.name).indexOf("special:") === 0) return "no-workspace"
@@ -1220,27 +1270,33 @@ Item {
   }
 
   // Same fresh-query-is-ground-truth approach as finishStash(), but the
-  // resulting descriptors live only in this function's local scope, never
+  // resulting metaMap lives only in this call's local scope, never
   // root.meta — a bulk move has nothing to remember afterward, so there's
-  // no bookkeeping to keep in sync with anything else.
+  // no bookkeeping to keep in sync with anything else. metaMap is built
+  // once, here, and never mutated afterward (GPT review amendment 2) —
+  // walkAndDispatch() (for the 2+ representative path, via
+  // finishMoveDecomposition()) reads geometry from it exactly as
+  // restore() reads root.meta, and the values keep reflecting each
+  // window's *original* source-workspace geometry even after
+  // decomposition has physically relocated the windows themselves.
   function finishMoveWorkspace(clients) {
-    var descriptors = []
+    var metaMap = {}
+    var sourceClients = []
     for (var i = 0; i < clients.length; i++) {
       var c = clients[i]
       if (!c || !c.workspace || c.workspace.name !== root.pendingMoveSourceWorkspace) continue
       var address = root.normalizedAddress({ address: c.address })
       if (!address) continue
-      descriptors.push({
-        address: address,
-        batchId: 0,
+      metaMap[address] = {
         x: Array.isArray(c.at) ? c.at[0] : 0,
         y: Array.isArray(c.at) ? c.at[1] : 0,
         width: Array.isArray(c.size) ? c.size[0] : 0,
         height: Array.isArray(c.size) ? c.size[1] : 0,
         floating: !!c.floating
-      })
+      }
+      sourceClients.push(c)
     }
-    if (descriptors.length === 0) return
+    if (sourceClients.length === 0) return
 
     var destination = root.pendingMoveTargetWorkspace
     var targetWorkspace = null
@@ -1255,34 +1311,133 @@ Item {
     // not solved further here).
     var monitor = (targetWorkspace && targetWorkspace.monitor) || root.pendingMoveSourceMonitor || null
 
-    // Occupancy comes from this same fresh query, not a second one — it
-    // already covers every workspace, source and target alike, so no
-    // extra hyprctl round-trip is needed to answer this too.
+    // Frozen occupancy snapshot (GPT review amendment 1): computed exactly
+    // once, here, from this same fresh capture, before anything moves —
+    // never recomputed mid-operation. Decomposition's own destructive
+    // per-step moves land windows on `destination` partway through the
+    // sequence; occupied must keep reflecting whether the destination had
+    // *other, pre-existing* windows before this operation started, not
+    // whatever it happens to hold right now.
     var occupied = clients.some(function(c) {
       return c && c.workspace && c.workspace.name === destination
     })
 
-    var byAddress = {}
-    for (var k = 0; k < descriptors.length; k++) byAddress[descriptors[k].address] = descriptors[k]
-    var orderedResult = root.orderDescriptors(descriptors)
-    var ordered = orderedResult.order.map(function(d) { return d.address })
-    var unresolved = orderedResult.unresolved
-
-    var structure = []
-    var geometry = []
-    var previousMeta = null
-    for (var m = 0; m < ordered.length; m++) {
-      var address = ordered[m]
-      var d = byAddress[address]
-      structure = structure.concat(root.structureClauses(address, destination, d, previousMeta))
-      geometry = geometry.concat(root.geometryClauses(address, d, monitor, occupied || unresolved[address]))
-      if (d && !d.floating) previousMeta = d
+    var floatingAddresses = []
+    var tiledClients = []
+    for (var t = 0; t < sourceClients.length; t++) {
+      var tc = sourceClients[t]
+      var tAddr = root.normalizedAddress({ address: tc.address })
+      if (metaMap[tAddr].floating) floatingAddresses.push(tAddr)
+      else tiledClients.push(tc)
     }
 
-    // Same cursor-warp issue restore() has, for the same reason
-    // (structureClauses() focuses each tiled window it places) — see
-    // finishRestore() above. Clauses are ready; hold them and query
-    // cursor position before actually dispatching anything.
+    // Floating windows' clauses are built now but never dispatched on
+    // their own — held until the tiled path below has fully resolved
+    // (trivial move, decomposition success, or decomposition failure),
+    // then dispatched together as one combined hyprctl --batch. Floating
+    // windows stay physically untouched until then (GPT review amendment
+    // 5), same as finishStash()'s own floating/tiled separation.
+    var floatingStructure = []
+    var floatingGeometry = []
+    for (var f = 0; f < floatingAddresses.length; f++) {
+      var fa = floatingAddresses[f]
+      floatingStructure = floatingStructure.concat(root.structureClauses(fa, destination, metaMap[fa], null, null))
+      floatingGeometry = floatingGeometry.concat(root.geometryClauses(fa, metaMap[fa], monitor, occupied))
+    }
+
+    if (tiledClients.length === 0) {
+      root.pendingMoveClauses = floatingStructure.concat(floatingGeometry)
+      if (root.pendingMoveClauses.length === 0) return
+      moveCursorProcess.running = true
+      return
+    }
+
+    var grouped = root.collapseGroups(tiledClients)
+    var representatives = Object.keys(grouped.representativeOf)
+
+    if (representatives.length <= 1) {
+      // 0-1 representative: no reconstruction needed or possible, matches
+      // today's exact simple-move behavior — just every tiled client
+      // (not just the representative) placed in its own captured order,
+      // merged with the already-built floating clauses.
+      var structure = floatingStructure.slice()
+      var geometry = floatingGeometry.slice()
+      var previousMeta = null
+      for (var s = 0; s < tiledClients.length; s++) {
+        var sAddr = root.normalizedAddress({ address: tiledClients[s].address })
+        var sMeta = metaMap[sAddr]
+        structure = structure.concat(root.structureClauses(sAddr, destination, sMeta, previousMeta))
+        geometry = geometry.concat(root.geometryClauses(sAddr, sMeta, monitor, occupied))
+        previousMeta = sMeta
+      }
+      root.pendingMoveClauses = structure.concat(geometry)
+      if (root.pendingMoveClauses.length === 0) return
+      moveCursorProcess.running = true
+      return
+    }
+
+    // 2+ representatives: hand off to the same decomposition sequencer
+    // stash() uses, targeting `destination` directly instead of the stash
+    // scratchpad — see finishMoveDecomposition() below for what happens
+    // once it completes.
+    root.beginDecomposition(0, root.pendingMoveSourceWorkspace, representatives, grouped.representativeOf, destination, {
+      purpose: "move",
+      metaMap: metaMap,
+      monitor: monitor,
+      occupied: occupied,
+      floatingStructure: floatingStructure,
+      floatingGeometry: floatingGeometry
+    })
+  }
+
+  // Purpose "move" completion callback, invoked from completeDecomposition()
+  // once reconstruction has run. By this point every tiled representative
+  // has been destructively relocated onto root.stashWorkspace by the
+  // sequencer itself, exactly like a real stash — never onto
+  // st.destinationWorkspace directly (see beginDecomposition() above for
+  // why that direct-redispatch approach was tried first and reliably
+  // scrambled left/right order live). The resolved-tree case below is
+  // therefore a genuine cross-workspace replay, root.stashWorkspace ->
+  // st.destinationWorkspace, exactly matching restore()'s own proven
+  // mechanism — not a same-workspace redispatch.
+  function finishMoveDecomposition(st, tree) {
+    var structure = st.floatingStructure.slice()
+    var geometry = st.floatingGeometry.slice()
+
+    if (tree) {
+      var walked = root.walkAndDispatch(tree, st.destinationWorkspace, st.monitor,
+        function(addr) { return st.occupied }, null, null, st.metaMap)
+      structure = structure.concat(walked.structure)
+      geometry = geometry.concat(walked.geometry)
+    } else {
+      // Reconstruction failed/unresolved. Unlike stash()'s own unresolved
+      // case (safe to leave parked in root.stashWorkspace indefinitely —
+      // restore() will sort it out later via peelOrder()), leaving these
+      // windows in root.stashWorkspace here would silently strand this
+      // move's windows in the scratchpad: there's no root.batchPlans entry
+      // for a "move" batch, so nothing would ever pull them back out
+      // in the same way a real restore() would (GPT review amendment 4,
+      // revised for the stash-transit design — the original amendment
+      // assumed the failure case left windows already on the real
+      // destination, which stopped being true once decomposition moved to
+      // always transiting through root.stashWorkspace). Still deliberately
+      // avoid a full peelOrder()-based structural reconstruction attempt
+      // against a source topology that no longer exists: instead, every
+      // surviving representative is moved onto the real destination
+      // individually, each treated as if it were the very first window
+      // placed (no preselect chaining, no forced absolute resize) — a
+      // deliberately "natural", structure-free placement, safe precisely
+      // because it doesn't try to reproduce anything.
+      for (var i = 0; i < st.addresses.length; i++) {
+        var repAddr = st.addresses[i]
+        var liveAddr = root.resolveLiveAddress(root.makeLeaf(repAddr, st.groupMembersByAddress[repAddr]))
+        if (!liveAddr) continue
+        var m = st.metaMap[liveAddr]
+        structure = structure.concat(root.structureClauses(liveAddr, st.destinationWorkspace, m, null, null))
+        geometry = geometry.concat(root.geometryClauses(liveAddr, m, st.monitor, true))
+      }
+    }
+
     root.pendingMoveClauses = structure.concat(geometry)
     if (root.pendingMoveClauses.length === 0) return
     moveCursorProcess.running = true
