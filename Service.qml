@@ -106,6 +106,7 @@ Item {
 
   onStashedToplevelsChanged: {
     root.pruneMeta()
+    root.pruneBatchPlans()
     if (root.collisionRestoreInFlight && stashedToplevels.length === 0) root.finishCollisionRestore()
   }
 
@@ -164,7 +165,16 @@ Item {
   // removes that cross-window ordering gap. (stash() doesn't need this —
   // moveAddress() alone is enough there, since park order in the hidden
   // workspace is never read back.)
-  function structureClauses(address, destination, meta, previousMeta) {
+  // `previousAddress`: optional. The flat/caterpillar loop below never
+  // passes it — each step's `previousMeta` is always the immediately
+  // -preceding dispatch, so Hyprland's own currently-focused window
+  // already matches it for free. The representative-leaf tree-walk
+  // (walkAndDispatch() below) routinely needs to refocus a window from
+  // several steps back, which is *not* what's currently focused — passing
+  // `previousAddress` adds an explicit refocus clause first. Harmless and
+  // redundant when the target's already focused (the flat case, if it
+  // were ever passed there), load-bearing for the tree-walk.
+  function structureClauses(address, destination, meta, previousMeta, previousAddress) {
     if (!address || !destination) return []
     var move = "hl.dsp.window.move({ workspace = " + JSON.stringify(destination)
       + ", window = " + JSON.stringify("address:" + address) + ", follow = false })"
@@ -173,6 +183,10 @@ Item {
     if (!previousMeta) return [move, focus].map(root.dispatchClause)
     var direction = root.preselectDirection(meta, previousMeta)
     var preselect = "hl.dsp.layout(" + JSON.stringify("preselect " + direction) + ")"
+    if (previousAddress) {
+      var refocus = "hl.dsp.focus({ window = " + JSON.stringify("address:" + previousAddress) + " })"
+      return [refocus, preselect, move, focus].map(root.dispatchClause)
+    }
     return [preselect, move, focus].map(root.dispatchClause)
   }
 
@@ -368,6 +382,497 @@ Item {
     return { addresses: result.order.map(function(d) { return d.address }), unresolved: result.unresolved }
   }
 
+  // ============================================================
+  // D reconstruction: destructive decomposition during stash,
+  // representative-leaf replay during restore. See
+  // docs/D-ONLY-IMPLEMENTATION-PLAN.md for the full design and
+  // docs/RECONSTRUCTION-EXPERIMENTS.md for the evidence trail — every
+  // mechanism below was proven live (128+ compositor runs) before being
+  // ported here, including several real bugs found and fixed during that
+  // process (documented at each fix site below). `peelOrder()`/
+  // `isSeparated()` above stay in the file, reachable as the fallback
+  // for any batch this can't resolve — never deleted by this change.
+  // ============================================================
+
+  // Batch-level reconstructed trees live here, not in root.meta — a tree
+  // has no natural single "owning" window among a batch's per-window meta
+  // entries, and duplicating it across every window in the batch would
+  // risk drift if one copy got updated and others didn't. Keyed the same
+  // way batches already are.
+  property var batchPlans: ({})
+
+  // Held for the *entire* decomposition sequence, not just the initial
+  // capture: stash()'s pre-existing busy-check only covers
+  // stashCaptureProcess, which exits quickly — the sequencer that follows
+  // can run for many async steps, and a second stash/restore/move
+  // triggered mid-sequence must be rejected the same way today's other
+  // "busy" cases already are, not race against in-flight state.
+  property bool decompositionInFlight: false
+
+  function isAddressLive(address) {
+    var values = Hyprland.toplevels && Hyprland.toplevels.values ? Hyprland.toplevels.values : []
+    for (var i = 0; i < values.length; i++) {
+      if (root.normalizedAddress(values[i]) === address) return true
+    }
+    return false
+  }
+
+  // A group leaf's chosen representative address can close while its
+  // groupmates survive — resolve to whichever member is still alive
+  // instead of failing the whole leaf. Confirmed live: moving or resizing
+  // any surviving group member carries the whole group for move/resize
+  // purposes, so any live member is an equally valid dispatch target.
+  function resolveLiveAddress(leafNode) {
+    if (!leafNode) return null
+    if (root.isAddressLive(leafNode.address)) return leafNode.address
+    var members = leafNode.groupMembers || [leafNode.address]
+    for (var i = 0; i < members.length; i++) {
+      if (root.isAddressLive(members[i])) return members[i]
+    }
+    return null
+  }
+
+  function makeLeaf(address, groupMembers) {
+    return { isLeaf: true, address: address, groupMembers: groupMembers || [address] }
+  }
+
+  function makeSplit(axis, first, second) {
+    return { isLeaf: false, axis: axis, first: first, second: second }
+  }
+
+  // Collapses each Hyprland group (the `grouped` field already present in
+  // `hyprctl -j clients` — no new query) to one deterministic
+  // representative address per group. Returns
+  // { representativeOf: {repAddr: [members...]}, memberOf: {addr: repAddr} }.
+  function collapseGroups(clients) {
+    var memberOf = {}
+    var representativeOf = {}
+    var seen = {}
+    for (var i = 0; i < clients.length; i++) {
+      var c = clients[i]
+      var address = root.normalizedAddress({ address: c.address })
+      if (!address || seen[address]) continue
+      var groupRaw = Array.isArray(c.grouped) ? c.grouped : []
+      var members = [address]
+      for (var j = 0; j < groupRaw.length; j++) {
+        var m = root.normalizedAddress({ address: groupRaw[j] })
+        if (m && members.indexOf(m) === -1) members.push(m)
+      }
+      members.sort()
+      var rep = members[0]
+      representativeOf[rep] = members
+      for (var k = 0; k < members.length; k++) {
+        memberOf[members[k]] = rep
+        seen[members[k]] = true
+      }
+    }
+    return { representativeOf: representativeOf, memberOf: memberOf }
+  }
+
+  // Any deterministic order works (proven order-independent by a 15/15
+  // random-order live sweep) — leaves the first-captured address as the
+  // implicit final survivor, moved explicitly once the loop finishes (see
+  // finishDecompositionSurvivor() below — the N-1 diffing steps alone
+  // never touch it).
+  function partitionRemovalOrder(addresses) {
+    return addresses.slice(1)
+  }
+
+  function unionBbox(rects, addresses) {
+    var x0 = null, y0 = null, x1 = null, y1 = null
+    for (var i = 0; i < addresses.length; i++) {
+      var r = rects[addresses[i]]
+      if (!r) continue
+      if (x0 === null || r.x < x0) x0 = r.x
+      if (y0 === null || r.y < y0) y0 = r.y
+      if (x1 === null || r.x + r.width > x1) x1 = r.x + r.width
+      if (y1 === null || r.y + r.height > y1) y1 = r.y + r.height
+    }
+    if (x0 === null) return null
+    return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+  }
+
+  // Infers which axis a removed window was adjacent to the surviving
+  // cluster along, from the BEFORE snapshot alone — deliberately does not
+  // depend on the cluster resizing afterward. An earlier version compared
+  // bounding-box size deltas instead and broke on real pseudo-tiled
+  // windows: they re-center within a larger slot without resizing into
+  // it, so both size deltas can be zero even though the window plainly
+  // moved. Fixed by comparing overlap on each axis instead, which stays
+  // well-defined regardless of whether the surviving side resizes.
+  function inferAxisAndDirection(removedRect, clusterBbox) {
+    var xOverlap = Math.min(removedRect.x + removedRect.width, clusterBbox.x + clusterBbox.width) - Math.max(removedRect.x, clusterBbox.x)
+    var yOverlap = Math.min(removedRect.y + removedRect.height, clusterBbox.y + clusterBbox.height) - Math.max(removedRect.y, clusterBbox.y)
+    if (xOverlap >= yOverlap) {
+      return { axis: "H", removedIsFirst: removedRect.y < clusterBbox.y }
+    }
+    return { axis: "V", removedIsFirst: removedRect.x < clusterBbox.x }
+  }
+
+  function groupKey(addressList) {
+    return addressList.slice().sort().join(",")
+  }
+
+  // Worklist reconstruction: repeatedly resolves whichever pending
+  // transition-record entry currently has all its `changed` addresses in
+  // one already-built group, restarting the scan from the beginning after
+  // every merge. That restart is load-bearing, not defensive styling — a
+  // plain single-pass scan can resolve a later-recorded entry before an
+  // earlier one gets a chance at the same group, silently locking in a
+  // structurally wrong (but plausible-looking) tree — found live on a
+  // real 6-window fixture during testing. Returns { tree } or { error }
+  // — never a best-guess wrong tree.
+  function reconstructTree(record, addresses, groupMembersByAddress) {
+    var node = {}
+    var groupOf = {}
+    for (var i = 0; i < addresses.length; i++) {
+      var a = addresses[i]
+      node[root.groupKey([a])] = root.makeLeaf(a, groupMembersByAddress[a] || [a])
+      groupOf[a] = [a]
+    }
+
+    var pending = record.slice()
+    var idx = 0
+    while (pending.length > 0) {
+      if (idx >= pending.length) {
+        return { tree: null, error: "stuck: " + pending.length + " step(s) never became resolvable" }
+      }
+      var entry = pending[idx]
+      if (!entry.changed || entry.changed.length === 0 || entry.axis === null) {
+        return { tree: null, error: "step removing " + entry.removed + ": no valid compensating info" }
+      }
+      var changedGroups = []
+      var changedKeys = {}
+      var ok = true
+      for (var c = 0; c < entry.changed.length; c++) {
+        var g = groupOf[entry.changed[c]]
+        if (!g) { ok = false; break }
+        var k = root.groupKey(g)
+        if (!changedKeys[k]) { changedKeys[k] = true; changedGroups.push(g) }
+      }
+      var removedGroup = groupOf[entry.removed]
+      if (!ok || !removedGroup || changedGroups.length !== 1
+          || root.groupKey(removedGroup) === root.groupKey(changedGroups[0])) {
+        idx += 1
+        continue
+      }
+      var siblingGroup = changedGroups[0]
+      var siblingNode = node[root.groupKey(siblingGroup)]
+      var removedNode = node[root.groupKey(removedGroup)]
+      var newNode = entry.removedIsFirst
+        ? root.makeSplit(entry.axis, removedNode, siblingNode)
+        : root.makeSplit(entry.axis, siblingNode, removedNode)
+      var newGroup = siblingGroup.concat(removedGroup)
+      var newKey = root.groupKey(newGroup)
+      node[newKey] = newNode
+      for (var m = 0; m < newGroup.length; m++) groupOf[newGroup[m]] = newGroup
+      pending.splice(idx, 1)
+      idx = 0
+    }
+
+    var finalNode = node[root.groupKey(addresses)]
+    if (!finalNode) return { tree: null, error: "reconstruction incomplete" }
+    return { tree: finalNode, error: null }
+  }
+
+  function collectLeafAddresses(node, out) {
+    if (!node) return
+    if (node.isLeaf) { out.push(node.address); return }
+    root.collectLeafAddresses(node.first, out)
+    root.collectLeafAddresses(node.second, out)
+  }
+
+  // Structural self-check run before a reconstructed tree is ever stored
+  // or dispatched: live testing could compare against ground truth,
+  // production has none, so this confirms the tree's own leaf set exactly
+  // matches what was actually captured — no duplicates, nothing missing.
+  function validateTree(tree, expectedAddresses) {
+    if (!tree) return false
+    var collected = []
+    root.collectLeafAddresses(tree, collected)
+    if (collected.length !== expectedAddresses.length) return false
+    var expected = {}
+    for (var i = 0; i < expectedAddresses.length; i++) expected[expectedAddresses[i]] = true
+    var seen = {}
+    for (var j = 0; j < collected.length; j++) {
+      var a = collected[j]
+      if (!expected[a] || seen[a]) return false
+      seen[a] = true
+    }
+    return true
+  }
+
+  function representativeOfNode(node) {
+    return node.isLeaf ? node : root.representativeOfNode(node.first)
+  }
+
+  // Representative-leaf preorder expansion, replacing the flat
+  // previousMeta-threaded loop for any batch with a resolved tree: place a
+  // subtree's two representatives as a pair before recursing into either
+  // side. Proven 128/128 across every orientation, ratio, and window
+  // count tested. `skipTiledResizeFor(address)` mirrors the existing
+  // `occupied || unresolved[address]` decision, just as a function so the
+  // caller can vary it per address if needed. `incomingMeta`/
+  // `incomingAddress` are the cross-batch anchor (see finishRestore()) —
+  // null for the very first batch. Returns { structure, geometry,
+  // lastMeta, lastAddress } — the last two are the outgoing anchor for
+  // whatever batch comes next.
+  function walkAndDispatch(tree, destination, monitor, skipTiledResizeFor, incomingMeta, incomingAddress) {
+    var structure = []
+    var geometry = []
+    var lastMeta = incomingMeta
+    var lastAddress = incomingAddress
+
+    function dispatchOne(leafNode, focusAddress, focusMeta) {
+      var address = root.resolveLiveAddress(leafNode)
+      if (!address) return
+      var m = root.meta[address]
+      structure = structure.concat(root.structureClauses(address, destination, m, focusMeta, focusAddress))
+      geometry = geometry.concat(root.geometryClauses(address, m, monitor, skipTiledResizeFor(address)))
+      if (m && !m.floating) { lastMeta = m; lastAddress = address }
+    }
+
+    function expand(node) {
+      if (node.isLeaf) return
+      var repA = root.representativeOfNode(node.first)
+      var repB = root.representativeOfNode(node.second)
+      var addrA = root.resolveLiveAddress(repA)
+      dispatchOne(repB, addrA, addrA ? root.meta[addrA] : null)
+      expand(node.first)
+      expand(node.second)
+    }
+
+    dispatchOne(root.representativeOfNode(tree), incomingAddress, incomingMeta)
+    expand(tree)
+
+    return { structure: structure, geometry: geometry, lastMeta: lastMeta, lastAddress: lastAddress }
+  }
+
+  // Stale-tree pruning: a window can close *after* a successful stash,
+  // while just sitting in the stash workspace, before restore is ever
+  // called — leaving a stored tree referencing a now-dead address. Hooked
+  // into the same trigger pruneMeta() already uses (every live-toplevel
+  // -list change, i.e. every window close anywhere). A genuine tree edit,
+  // not a blanket invalidation: find the dead leaf, replace its *parent*
+  // Split with the leaf's *sibling* subtree (standard binary-tree leaf
+  // removal, promoting the sibling up one level) — the same "the tree
+  // closes over a removed leaf" operation the decomposition sequencer
+  // already embodies, just applied after the fact.
+  function pruneNodeForDeadAddress(node) {
+    // Returns { node, removed } — removed is true if this call's own
+    // level found and excised a dead leaf (caller promotes the sibling).
+    if (!node) return { node: node, removed: false }
+    if (node.isLeaf) {
+      var live = root.resolveLiveAddress(node)
+      if (!live) return { node: null, removed: true }
+      if (live !== node.address) return { node: root.makeLeaf(live, node.groupMembers), removed: false }
+      return { node: node, removed: false }
+    }
+    var firstResult = root.pruneNodeForDeadAddress(node.first)
+    if (firstResult.removed) return { node: firstResult.node === null ? node.second : root.makeSplit(node.axis, firstResult.node, node.second), removed: firstResult.node === null }
+    var secondResult = root.pruneNodeForDeadAddress(node.second)
+    if (secondResult.removed) return { node: secondResult.node === null ? firstResult.node : root.makeSplit(node.axis, firstResult.node, secondResult.node), removed: secondResult.node === null }
+    return { node: root.makeSplit(node.axis, firstResult.node, secondResult.node), removed: false }
+  }
+
+  function pruneBatchPlans() {
+    var next = {}
+    var changed = false
+    for (var batchId in root.batchPlans) {
+      var plan = root.batchPlans[batchId]
+      if (!plan || plan.unresolved || !plan.tree) { next[batchId] = plan; continue }
+      var result = root.pruneNodeForDeadAddress(plan.tree)
+      if (result.node !== plan.tree) {
+        changed = true
+        if (result.node === null) {
+          next[batchId] = { tree: null, unresolved: true }
+        } else {
+          var remaining = []
+          root.collectLeafAddresses(result.node, remaining)
+          var stillValid = root.validateTree(result.node, remaining)
+          next[batchId] = stillValid ? { tree: result.node, unresolved: false } : { tree: null, unresolved: true }
+        }
+      } else {
+        next[batchId] = plan
+      }
+    }
+    if (changed) root.batchPlans = next
+  }
+
+  function extractRectsForWorkspace(clients, workspaceName, addresses) {
+    var rects = {}
+    var wanted = {}
+    for (var i = 0; i < addresses.length; i++) wanted[addresses[i]] = true
+    for (var j = 0; j < clients.length; j++) {
+      var c = clients[j]
+      if (!c || !c.workspace || c.workspace.name !== workspaceName) continue
+      var address = root.normalizedAddress({ address: c.address })
+      if (!address || !wanted[address]) continue
+      rects[address] = {
+        x: Array.isArray(c.at) ? c.at[0] : 0,
+        y: Array.isArray(c.at) ? c.at[1] : 0,
+        width: Array.isArray(c.size) ? c.size[0] : 0,
+        height: Array.isArray(c.size) ? c.size[1] : 0
+      }
+    }
+    return rects
+  }
+
+  property var pendingDecomposition: null
+
+  // Kicks off D's destructive decomposition for one batch's tiled,
+  // group-collapsed representative addresses — the moves themselves ARE
+  // the stash (confirmed live in the seam integration test: not a probe
+  // followed by a separate stash pass).
+  function beginDecomposition(batchId, sourceWorkspace, addresses, groupMembersByAddress) {
+    root.decompositionInFlight = true
+    root.pendingDecomposition = {
+      batchId: batchId,
+      sourceWorkspace: sourceWorkspace,
+      addresses: addresses,
+      groupMembersByAddress: groupMembersByAddress,
+      removalOrder: root.partitionRemovalOrder(addresses),
+      stepIndex: 0,
+      remaining: addresses.slice(),
+      record: [],
+      beforeRects: null,
+      pendingRemoval: "",
+      phase: "before"
+    }
+    decomposeCaptureProcess.running = true
+  }
+
+  Process {
+    id: decomposeCaptureProcess
+    command: ["hyprctl", "-j", "clients"]
+    stdout: StdioCollector {
+      id: decomposeCaptureOutput
+      // Same reasoning as stashCaptureOutput/moveCaptureOutput above.
+      waitForEnd: false
+      onDataChanged: {
+        if (text.length > root.maxCaptureBytes) decomposeCaptureProcess.running = false
+      }
+    }
+    onExited: function(exitCode) {
+      var clients = []
+      if (exitCode === 0) {
+        try { clients = JSON.parse(decomposeCaptureOutput.text || "[]") } catch (e) { clients = [] }
+      }
+      root.onDecomposeCapture(clients)
+    }
+  }
+
+  // Not Quickshell.execDetached() — confirmed live (this is what made
+  // zero explicit settle-wait provably safe throughout testing) that a
+  // dispatch Process only exits once Hyprland has actually applied it, so
+  // chaining the next step on onExited gives the same free correctness
+  // guarantee in production that made every experiment's zero-wait
+  // captures reliable.
+  Process {
+    id: decomposeDispatchProcess
+    property string luaExpr: ""
+    command: ["hyprctl", "dispatch", luaExpr]
+    onExited: function(exitCode) {
+      decomposeCaptureProcess.running = true
+    }
+  }
+
+  // Two-phase-per-step state machine: "before" is both a missing-window
+  // check (a real SIGTERM mid-sequence is detected here, proven live in
+  // the seam integration test — never crashes, never strands a window)
+  // and this step's before-snapshot; "after" diffs against it once the
+  // move has actually landed.
+  function onDecomposeCapture(clients) {
+    var st = root.pendingDecomposition
+    if (!st) return
+    var rects = root.extractRectsForWorkspace(clients, st.sourceWorkspace, st.remaining)
+
+    if (st.phase === "before") {
+      var missing = []
+      for (var i = 0; i < st.remaining.length; i++) {
+        if (!(st.remaining[i] in rects)) missing.push(st.remaining[i])
+      }
+      for (var m = 0; m < missing.length; m++) {
+        var idx = st.remaining.indexOf(missing[m])
+        if (idx !== -1) st.remaining.splice(idx, 1)
+      }
+
+      if (st.stepIndex >= st.removalOrder.length) {
+        root.finishDecompositionSurvivor(rects)
+        return
+      }
+      var name = st.removalOrder[st.stepIndex]
+      if (st.remaining.indexOf(name) === -1) {
+        st.stepIndex += 1
+        decomposeCaptureProcess.running = true
+        return
+      }
+      st.beforeRects = rects
+      st.pendingRemoval = name
+      st.phase = "after"
+      decomposeDispatchProcess.luaExpr = "hl.dsp.window.move({ workspace = " + JSON.stringify(root.stashWorkspace)
+        + ", window = " + JSON.stringify("address:" + name) + ", follow = false })"
+      decomposeDispatchProcess.running = true
+      return
+    }
+
+    // phase === "after"
+    var removedName = st.pendingRemoval
+    var stillRemaining = st.remaining.filter(function(a) { return a !== removedName })
+    var afterRects = root.extractRectsForWorkspace(clients, st.sourceWorkspace, stillRemaining)
+    var changed = []
+    for (var k = 0; k < stillRemaining.length; k++) {
+      var a2 = stillRemaining[k]
+      var b = st.beforeRects[a2]
+      var af = afterRects[a2]
+      var sameRect = b && af && b.x === af.x && b.y === af.y && b.width === af.width && b.height === af.height
+      if (!sameRect) changed.push(a2)
+    }
+    var axis = null, removedIsFirst = null
+    if (changed.length > 0 && st.beforeRects[removedName]) {
+      var clusterBbox = root.unionBbox(st.beforeRects, changed)
+      if (clusterBbox) {
+        var inferred = root.inferAxisAndDirection(st.beforeRects[removedName], clusterBbox)
+        axis = inferred.axis
+        removedIsFirst = inferred.removedIsFirst
+      }
+    }
+    st.record.push({ removed: removedName, changed: changed, axis: axis, removedIsFirst: removedIsFirst })
+    st.remaining = stillRemaining
+    st.stepIndex += 1
+    st.phase = "before"
+    decomposeCaptureProcess.running = true
+  }
+
+  // The N-1 diffing steps alone never touch the final survivor — found
+  // live in the seam integration test (it was left stranded on the
+  // source workspace, never stashed). Explicit final move here, guarded
+  // on it actually still being present.
+  function finishDecompositionSurvivor(lastRects) {
+    var st = root.pendingDecomposition
+    var survivor = st.remaining.length > 0 ? st.remaining[0] : null
+    if (survivor && (survivor in lastRects)) {
+      root.moveAddress(survivor, root.stashWorkspace, false)
+    }
+    root.completeDecomposition()
+  }
+
+  function completeDecomposition() {
+    var st = root.pendingDecomposition
+    var result = root.reconstructTree(st.record, st.addresses, st.groupMembersByAddress)
+    var plan = { tree: null, unresolved: true }
+    if (result.tree && root.validateTree(result.tree, st.addresses)) {
+      plan = { tree: result.tree, unresolved: false }
+    }
+    var nextPlans = {}
+    for (var b in root.batchPlans) nextPlans[b] = root.batchPlans[b]
+    nextPlans[st.batchId] = plan
+    root.batchPlans = nextPlans
+
+    root.pendingDecomposition = null
+    root.decompositionInFlight = false
+  }
+
   property string pendingStashWorkspace: ""
   property int pendingStashBatchId: 0
 
@@ -387,7 +892,7 @@ Item {
   function stash() {
     var workspace = Hyprland.focusedWorkspace
     if (!workspace || String(workspace.name).indexOf("special:") === 0) return "no-workspace"
-    if (stashCaptureProcess.running) return "busy"
+    if (stashCaptureProcess.running || root.decompositionInFlight) return "busy"
 
     root.pendingStashWorkspace = workspace.name
     root.pendingStashBatchId = root.nextBatchId
@@ -422,13 +927,23 @@ Item {
   }
 
   // Determines eligibility *and* captures geometry from the same fresh
-  // query, then issues the moves — one ground-truth source for both,
-  // instead of letting them potentially disagree.
+  // query — one ground-truth source for both, instead of letting them
+  // potentially disagree. Meta is recorded for *every* eligible window
+  // here, unconditionally, before any strategy decision — floating and
+  // non-representative group members alike, since geometryClauses() and
+  // resolveLiveAddress() need it later regardless of how the window's
+  // move actually happened. Floating windows get today's exact simple
+  // independent move. Tiled windows are group-collapsed (collapseGroups())
+  // — 0-1 representative left means no reconstruction is possible or
+  // needed (matches today exactly); 2+ hands off to the decomposition
+  // sequencer, whose destructive moves *are* the stash for that batch
+  // (confirmed live in the seam integration test — not a probe followed
+  // by a separate stash pass).
   function finishStash(clients) {
     var nextMeta = {}
     for (var addr in root.meta) nextMeta[addr] = root.meta[addr]
 
-    var movedAny = false
+    var batchClients = []
     for (var i = 0; i < clients.length; i++) {
       var c = clients[i]
       if (!c || !c.workspace || c.workspace.name !== root.pendingStashWorkspace) continue
@@ -445,10 +960,36 @@ Item {
         appId: c.class || "",
         title: c.title || ""
       }
-      root.moveAddress(address, root.stashWorkspace, false)
-      movedAny = true
+      batchClients.push(c)
     }
-    if (movedAny) root.meta = nextMeta
+    if (batchClients.length === 0) return
+    root.meta = nextMeta
+
+    var floatingAddresses = []
+    var tiledClients = []
+    for (var j = 0; j < batchClients.length; j++) {
+      var bc = batchClients[j]
+      var bAddr = root.normalizedAddress({ address: bc.address })
+      if (nextMeta[bAddr].floating) floatingAddresses.push(bAddr)
+      else tiledClients.push(bc)
+    }
+
+    for (var f = 0; f < floatingAddresses.length; f++) {
+      root.moveAddress(floatingAddresses[f], root.stashWorkspace, false)
+    }
+    if (tiledClients.length === 0) return
+
+    var grouped = root.collapseGroups(tiledClients)
+    var representatives = Object.keys(grouped.representativeOf)
+
+    if (representatives.length <= 1) {
+      for (var t = 0; t < tiledClients.length; t++) {
+        root.moveAddress(root.normalizedAddress({ address: tiledClients[t].address }), root.stashWorkspace, false)
+      }
+      return
+    }
+
+    root.beginDecomposition(root.pendingStashBatchId, root.pendingStashWorkspace, representatives, grouped.representativeOf)
   }
 
   // Whether any live toplevel is already on `workspaceName` — read from the
@@ -483,7 +1024,7 @@ Item {
 
     var workspace = Hyprland.focusedWorkspace
     if (!workspace) return "no-workspace"
-    if (restoreCursorProcess.running) return "busy"
+    if (restoreCursorProcess.running || root.decompositionInFlight) return "busy"
 
     root.pendingRestoreSnapshot = snapshot
     root.pendingRestoreDestination = workspace.name
@@ -524,25 +1065,91 @@ Item {
   // so instead the cursor position is captured before dispatching anything
   // and explicitly moved back as the last clause in the same batch, after
   // every focus call has already had its say.
+  // Batches restore oldest-first, same as today. Within a batch: a
+  // resolved, validated tree (root.batchPlans) walks via
+  // walkAndDispatch()'s representative-leaf expansion; anything without
+  // one (unresolved, or a stash from before this change existed) falls
+  // back to today's exact peelOrder()-based flat ordering —
+  // peelOrder()/isSeparated() stay in the file for exactly this. Floating
+  // windows in either case never enter tree/peel logic at all, matching
+  // today. Cross-batch chaining preserved explicitly: today's flat loop
+  // threads one previousMeta continuously across *every* batch, not just
+  // within one (previousMeta is initialized once, before the whole loop,
+  // never reset per batch) — anchorMeta/anchorAddress below carry the
+  // same continuity across both tree-walked and flat-fallback batches
+  // alike, oldest batch first.
   function finishRestore(cursor) {
     var snapshot = root.pendingRestoreSnapshot
     var destination = root.pendingRestoreDestination
     var monitor = root.pendingRestoreMonitor
-
     var occupied = root.isWorkspaceOccupied(destination)
-    var restoreOrdered = root.restoreOrder(snapshot)
-    var ordered = restoreOrdered.addresses
-    var unresolved = restoreOrdered.unresolved
+
+    var byBatch = {}
+    var batchIds = []
+    for (var i = 0; i < snapshot.length; i++) {
+      var addr = snapshot[i]
+      var bm = root.meta[addr]
+      var batchId = bm ? bm.batchId : 0
+      if (!byBatch[batchId]) { byBatch[batchId] = []; batchIds.push(batchId) }
+      byBatch[batchId].push(addr)
+    }
+    batchIds.sort(function(a, b) { return a - b })
+
     var structure = []
     var geometry = []
-    var previousMeta = null
-    for (var i = 0; i < ordered.length; i++) {
-      var address = ordered[i]
-      var m = root.meta[address]
-      structure = structure.concat(root.structureClauses(address, destination, m, previousMeta))
-      geometry = geometry.concat(root.geometryClauses(address, m, monitor, occupied || unresolved[address]))
-      if (m && !m.floating) previousMeta = m
+    var anchorMeta = null
+    var anchorAddress = null
+
+    for (var b = 0; b < batchIds.length; b++) {
+      var batchId2 = batchIds[b]
+      var batchAddresses = byBatch[batchId2]
+
+      var floatingAddrs = []
+      var tiledAddrs = []
+      for (var j = 0; j < batchAddresses.length; j++) {
+        var a2 = batchAddresses[j]
+        var mm = root.meta[a2]
+        if (mm && mm.floating) floatingAddrs.push(a2)
+        else tiledAddrs.push(a2)
+      }
+
+      for (var f = 0; f < floatingAddrs.length; f++) {
+        var fa = floatingAddrs[f]
+        structure = structure.concat(root.structureClauses(fa, destination, root.meta[fa], null, null))
+        geometry = geometry.concat(root.geometryClauses(fa, root.meta[fa], monitor, occupied))
+      }
+
+      var plan = root.batchPlans[batchId2]
+      if (plan && !plan.unresolved && plan.tree && tiledAddrs.length > 0) {
+        var skipResizeFor = function(addr2) { return occupied }
+        var walked = root.walkAndDispatch(plan.tree, destination, monitor, skipResizeFor, anchorMeta, anchorAddress)
+        structure = structure.concat(walked.structure)
+        geometry = geometry.concat(walked.geometry)
+        anchorMeta = walked.lastMeta
+        anchorAddress = walked.lastAddress
+      } else if (tiledAddrs.length > 0) {
+        var descriptors = tiledAddrs.map(function(address) {
+          var dm = root.meta[address] || null
+          return {
+            address: address, batchId: batchId2,
+            x: dm ? dm.x : 0, y: dm ? dm.y : 0,
+            width: dm ? dm.width : 0, height: dm ? dm.height : 0
+          }
+        })
+        var peeled = root.peelOrder(descriptors)
+        var flatUnresolved = {}
+        for (var u = 0; u < peeled.unresolved.length; u++) flatUnresolved[peeled.unresolved[u].address] = true
+        var flatOrder = peeled.order.concat(peeled.unresolved)
+        for (var k = 0; k < flatOrder.length; k++) {
+          var fAddr = flatOrder[k].address
+          var fMeta = root.meta[fAddr]
+          structure = structure.concat(root.structureClauses(fAddr, destination, fMeta, anchorMeta, anchorAddress))
+          geometry = geometry.concat(root.geometryClauses(fAddr, fMeta, monitor, occupied || flatUnresolved[fAddr]))
+          if (fMeta && !fMeta.floating) { anchorMeta = fMeta; anchorAddress = fAddr }
+        }
+      }
     }
+
     var clauses = structure.concat(geometry)
     if (cursor) {
       clauses.push(root.dispatchClause(
@@ -553,10 +1160,16 @@ Item {
     }
 
     var nextMeta = {}
-    for (var addr in root.meta) {
-      if (snapshot.indexOf(addr) === -1) nextMeta[addr] = root.meta[addr]
+    for (var addr3 in root.meta) {
+      if (snapshot.indexOf(addr3) === -1) nextMeta[addr3] = root.meta[addr3]
     }
     root.meta = nextMeta
+
+    var nextPlans = {}
+    for (var pid in root.batchPlans) {
+      if (byBatch[pid] === undefined) nextPlans[pid] = root.batchPlans[pid]
+    }
+    root.batchPlans = nextPlans
   }
 
   property string pendingMoveSourceWorkspace: ""
@@ -576,7 +1189,7 @@ Item {
     var workspace = Hyprland.focusedWorkspace
     if (!workspace || String(workspace.name).indexOf("special:") === 0) return "no-workspace"
     if (String(workspace.name) === String(targetWorkspaceId)) return "same-workspace"
-    if (moveCaptureProcess.running) return "busy"
+    if (moveCaptureProcess.running || root.decompositionInFlight) return "busy"
 
     root.pendingMoveSourceWorkspace = workspace.name
     root.pendingMoveTargetWorkspace = String(targetWorkspaceId)

@@ -16,6 +16,12 @@ covers. There is no reserved-but-unbuilt scope left in this project as of
 this note; treat any further feature work as a new request to scope from
 scratch, not a continuation of an existing plan.
 
+One exception: `docs/RECONSTRUCTION.md` is an approved *design* (no code
+written yet) for replacing the layout-reconstruction limitation described
+below. It's scoped to a dedicated experimental branch, not `main` — see
+the "layout-reconstruction limitation" note further down for exactly what
+that means and what to read before touching any of it.
+
 Two behaviors worth knowing before touching restore/move code again:
 
 - Restoring or bulk-moving windows must never move the mouse cursor as a
@@ -46,19 +52,54 @@ Two behaviors worth knowing before touching restore/move code again:
   immediately-previous window in the resolved order. Confirmed live, not
   just from the Lua stub — see `docs/DESIGN-JOURNEY.md` §20.
 
-Do not try to fix the known, deliberately-accepted layout-reconstruction
-limitation (`docs/DESIGN-JOURNEY.md` §17, narrowed by §20): a genuinely
+The layout-reconstruction limitation (`docs/DESIGN-JOURNEY.md` §17,
+narrowed by §20) is still fully in effect on `main`: a genuinely
 multi-branch layout — an actual 2×2 grid, two independently-split columns —
 isn't reliably reconstructed today, because that requires the full
 split-tree inference `docs/FEATURES.md` §7.4 already named as hard and this
-project chose not to build. This is narrower than it used to be: the
-"lone window plus a stacked pair" case that looked like the same problem
-turned out to be fixable (see `peelOrder()` above) because it's still a
-caterpillar tree, just one the old sort ordered wrong. The remaining
-boundary was found, investigated, and explicitly accepted rather than
-fixed — twice reconfirmed by the project owner, not an oversight. Raise it
-in conversation before changing
-`restoreOrder()`/`structureClauses()`/`geometryClauses()` to address it.
+project originally chose not to build. This is narrower than it used to
+be: the "lone window plus a stacked pair" case that looked like the same
+problem turned out to be fixable (see `peelOrder()` above) because it's
+still a caterpillar tree, just one the old sort ordered wrong. The
+remaining boundary was found, investigated, and explicitly accepted on
+`main` — twice reconfirmed by the project owner as of that decision, not
+an oversight.
+
+That decision has since been revisited, and the resulting design has
+since been tested live — 128 real Hyprland runs plus targeted
+investigation of groups, pseudo-tiling, floating windows, occupied
+destinations, and multi-batch restore, all on the
+`experiment/tree-bipartition-restore` branch, none of it merged or
+touching `main`. `docs/RECONSTRUCTION.md` is the tested design;
+`docs/RECONSTRUCTION-EXPERIMENTS.md` is the full evidence trail and the
+resulting implementation checklist. The crux, compressed: Hyprland's
+Dwindle can only ever build a layout via full-span cuts of a focused
+container, so any layout it produced is guaranteed reconstructible by
+recursively cutting the *whole remaining group* into two non-empty
+pieces — not just peeling one fully-separable window off the outside,
+which is all `peelOrder()`/`isSeparated()` do today. The classifier alone
+isn't enough, though: §17 shows the actual dispatch loop only ever splits
+relative to one global "last window placed," so it can only ever build a
+linear chain; the insertion/dispatch sequencing has to change too — not,
+as first sketched and never built, to a per-subtree anchor tracked during
+a recursive walk, but to **representative-leaf preorder expansion**: give
+every subtree one fixed representative window, place a subtree's two
+representatives as a pair before recursing into either side. That's the
+mechanism that was actually tested — 40/40 on the first pass, holding
+across every later gate — so it's what `docs/RECONSTRUCTION.md` now
+describes; the anchor sketch never got built and shouldn't be. Read
+`docs/RECONSTRUCTION.md` in full before implementing any part of this —
+it has the idea-level reasoning, the data-flow, and a function-by
+-function map of exactly what's new, modified, and untouched
+(`structureClauses()`, `geometryClauses()`, and the actual
+`hyprctl --batch` dispatch stay unchanged either way).
+
+If you're reading this on `main` and the experimental branch above doesn't
+exist yet or hasn't been merged, treat the original instruction as still
+fully active: do not change
+`restoreOrder()`/`structureClauses()`/`geometryClauses()` to address this
+limitation without raising it in conversation first, and implement any of
+it only on the dedicated branch, never directly on `main`.
 
 Priorities:
 
