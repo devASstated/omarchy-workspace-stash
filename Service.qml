@@ -50,6 +50,18 @@ Item {
     return str.length > maxLength ? str.slice(0, maxLength) : str
   }
 
+  // hyprctl's own reply to "-j clients" embeds the same untrusted window
+  // titles/classes as above, and Quickshell's StdioCollector fully buffers
+  // it in memory before anything gets a chance to parse it — the clip
+  // above only bounds what reaches QML, not what's collected from the
+  // process in the first place. This bounds that raw collection itself
+  // (see stashCaptureOutput/moveCaptureOutput below), so a misbehaving
+  // window can't force an arbitrarily large in-memory buffer even before
+  // parsing. A real "hyprctl -j clients" here runs ~2KB; this leaves
+  // generous headroom for legitimate use while still refusing truly
+  // pathological output.
+  readonly property int maxCaptureBytes: 4194304
+
   // Presentation-ready snapshot for the bar widget: identity and live display
   // fields come straight from Hyprland every time; batch/source come from the
   // auxiliary map when available.
@@ -389,7 +401,16 @@ Item {
     command: ["hyprctl", "-j", "clients"]
     stdout: StdioCollector {
       id: stashCaptureOutput
-      waitForEnd: true
+      // waitForEnd: false so dataChanged fires per chunk as output streams
+      // in, instead of only once the whole thing has already been
+      // collected — needed so the guard below can cut off a runaway
+      // capture before it grows unbounded, not just notice afterward. The
+      // complete text is still available in onExited below exactly as
+      // before; only the timing of intermediate updates changes.
+      waitForEnd: false
+      onDataChanged: {
+        if (text.length > root.maxCaptureBytes) stashCaptureProcess.running = false
+      }
     }
     onExited: function(exitCode) {
       var clients = []
@@ -569,7 +590,12 @@ Item {
     command: ["hyprctl", "-j", "clients"]
     stdout: StdioCollector {
       id: moveCaptureOutput
-      waitForEnd: true
+      // Same reasoning as stashCaptureOutput above — see there for why
+      // waitForEnd is false and what the guard does.
+      waitForEnd: false
+      onDataChanged: {
+        if (text.length > root.maxCaptureBytes) moveCaptureProcess.running = false
+      }
     }
     onExited: function(exitCode) {
       var clients = []
