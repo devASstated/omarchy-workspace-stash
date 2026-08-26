@@ -1130,6 +1130,33 @@ Item {
     }
     batchIds.sort(function(a, b) { return a - b })
 
+    // Cross-batch merge geometry fix: each batch's tiled windows were
+    // captured with absolute sizes valid only relative to whatever else
+    // was on THEIR OWN original source workspace — never relative to any
+    // other batch. Forcing two independently-captured batches' absolute
+    // sizes into the same destination collapses one of them (confirmed
+    // live: a lone full-workspace window from workspace 1 merged with a
+    // lone full-workspace window from workspace 2 squeezed the second down
+    // to a sliver). root.isWorkspaceOccupied() above only catches the
+    // destination having OTHER, pre-existing content before this restore
+    // started — it says nothing about this restore itself merging 2+
+    // independent batches together. counted by unique batchIds among
+    // TILED windows only (GPT review) — a second, floating-only batch
+    // shouldn't suppress a tiled batch's own resize, since floating
+    // geometry never depends on tiled sibling structure anyway.
+    var tiledBatchCount = 0
+    for (var tb = 0; tb < batchIds.length; tb++) {
+      var tbAddrs = byBatch[batchIds[tb]]
+      var hasTiled = false
+      for (var ta = 0; ta < tbAddrs.length; ta++) {
+        var tm = root.meta[tbAddrs[ta]]
+        if (!tm || !tm.floating) { hasTiled = true; break }
+      }
+      if (hasTiled) tiledBatchCount++
+    }
+    var multiTiledBatchMerge = tiledBatchCount > 1
+    var effectiveOccupied = occupied || multiTiledBatchMerge
+
     var structure = []
     var geometry = []
     var anchorMeta = null
@@ -1156,7 +1183,7 @@ Item {
 
       var plan = root.batchPlans[batchId2]
       if (plan && !plan.unresolved && plan.tree && tiledAddrs.length > 0) {
-        var skipResizeFor = function(addr2) { return occupied }
+        var skipResizeFor = function(addr2) { return effectiveOccupied }
         var walked = root.walkAndDispatch(plan.tree, destination, monitor, skipResizeFor, anchorMeta, anchorAddress)
         structure = structure.concat(walked.structure)
         geometry = geometry.concat(walked.geometry)
@@ -1179,7 +1206,7 @@ Item {
           var fAddr = flatOrder[k].address
           var fMeta = root.meta[fAddr]
           structure = structure.concat(root.structureClauses(fAddr, destination, fMeta, anchorMeta, anchorAddress))
-          geometry = geometry.concat(root.geometryClauses(fAddr, fMeta, monitor, occupied || flatUnresolved[fAddr]))
+          geometry = geometry.concat(root.geometryClauses(fAddr, fMeta, monitor, effectiveOccupied || flatUnresolved[fAddr]))
           if (fMeta && !fMeta.floating) { anchorMeta = fMeta; anchorAddress = fAddr }
         }
       }
