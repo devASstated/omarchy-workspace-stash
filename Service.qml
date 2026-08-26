@@ -1014,16 +1014,20 @@ Item {
     }
     if (tiledClients.length === 0) return
 
+    // Unified D pipeline (experiment/d-unified-pipeline): every tiled
+    // batch enters beginDecomposition() unconditionally, no representative
+    // -count special-casing here. representatives.length is always >= 1
+    // at this point (tiledClients.length > 0 was already checked above).
+    // beginDecomposition()/onDecomposeCapture()/finishDecompositionSurvivor()
+    // already degrade correctly to a single quick capture + one survivor
+    // move + a trivial reconstructTree() identity for representatives.length
+    // === 1 -- no changes needed there, confirmed by reading through the
+    // existing removalOrder = addresses.slice(1) / stepIndex >=
+    // removalOrder.length logic: for a 1-element addresses array,
+    // removalOrder is already empty, so the very first capture callback
+    // takes the "finish immediately" path with zero destructive steps.
     var grouped = root.collapseGroups(tiledClients)
     var representatives = Object.keys(grouped.representativeOf)
-
-    if (representatives.length <= 1) {
-      for (var t = 0; t < tiledClients.length; t++) {
-        root.moveAddress(root.normalizedAddress({ address: tiledClients[t].address }), root.stashWorkspace, false)
-      }
-      return
-    }
-
     root.beginDecomposition(root.pendingStashBatchId, root.pendingStashWorkspace, representatives, grouped.representativeOf, root.stashWorkspace)
   }
 
@@ -1190,24 +1194,27 @@ Item {
         anchorMeta = walked.lastMeta
         anchorAddress = walked.lastAddress
       } else if (tiledAddrs.length > 0) {
-        var descriptors = tiledAddrs.map(function(address) {
-          var dm = root.meta[address] || null
-          return {
-            address: address, batchId: batchId2,
-            x: dm ? dm.x : 0, y: dm ? dm.y : 0,
-            width: dm ? dm.width : 0, height: dm ? dm.height : 0
-          }
-        })
-        var peeled = root.peelOrder(descriptors)
-        var flatUnresolved = {}
-        for (var u = 0; u < peeled.unresolved.length; u++) flatUnresolved[peeled.unresolved[u].address] = true
-        var flatOrder = peeled.order.concat(peeled.unresolved)
-        for (var k = 0; k < flatOrder.length; k++) {
-          var fAddr = flatOrder[k].address
-          var fMeta = root.meta[fAddr]
-          structure = structure.concat(root.structureClauses(fAddr, destination, fMeta, anchorMeta, anchorAddress))
-          geometry = geometry.concat(root.geometryClauses(fAddr, fMeta, monitor, effectiveOccupied || flatUnresolved[fAddr]))
-          if (fMeta && !fMeta.floating) { anchorMeta = fMeta; anchorAddress = fAddr }
+        // No resolved tree for this batch — either a genuine D
+        // reconstruction failure (plan.unresolved, never observed live
+        // across this whole session) or a legacy stash from before every
+        // batch received a BatchPlan (no root.batchPlans entry at all).
+        // Unified D pipeline principle: D either knows the structure or
+        // admits it doesn't — no second, weaker reconstruction engine
+        // (peelOrder()) gets to reinterpret the same failure by guessing
+        // an order. Each window is placed independently — no preselect
+        // chaining, no forced absolute resize — same "natural safe
+        // placement" already used for moveWorkspaceTo()'s own
+        // reconstruction-failure fallback (finishMoveDecomposition()).
+        // peelOrder()/isSeparated()/orderDescriptors() stay physically in
+        // this file (experiment: not deleted), but are unreachable from
+        // any batch produced by this branch's finishStash()/
+        // finishMoveWorkspace() going forward.
+        for (var n = 0; n < tiledAddrs.length; n++) {
+          var nAddr = tiledAddrs[n]
+          var nMeta = root.meta[nAddr]
+          structure = structure.concat(root.structureClauses(nAddr, destination, nMeta, null, null))
+          geometry = geometry.concat(root.geometryClauses(nAddr, nMeta, monitor, true))
+          if (nMeta && !nMeta.floating) { anchorMeta = nMeta; anchorAddress = nAddr }
         }
       }
     }
@@ -1379,34 +1386,19 @@ Item {
       return
     }
 
+    // Unified D pipeline (experiment/d-unified-pipeline): every tiled
+    // batch (1+ representatives) hands off to the same decomposition
+    // sequencer stash() uses, no representative-count special-casing —
+    // see finishStash() above for why this degrades correctly for a
+    // single representative with no extra async cost beyond one capture
+    // round-trip. destinationWorkspace is the real target; per the
+    // stash-transit design, the sequencer's own internal moves always go
+    // through root.stashWorkspace regardless — see
+    // finishMoveDecomposition() below for what happens once it completes
+    // (a genuine cross-workspace replay onto the real destination, same
+    // mechanism whether this batch is a single window or a real grid).
     var grouped = root.collapseGroups(tiledClients)
     var representatives = Object.keys(grouped.representativeOf)
-
-    if (representatives.length <= 1) {
-      // 0-1 representative: no reconstruction needed or possible, matches
-      // today's exact simple-move behavior — just every tiled client
-      // (not just the representative) placed in its own captured order,
-      // merged with the already-built floating clauses.
-      var structure = floatingStructure.slice()
-      var geometry = floatingGeometry.slice()
-      var previousMeta = null
-      for (var s = 0; s < tiledClients.length; s++) {
-        var sAddr = root.normalizedAddress({ address: tiledClients[s].address })
-        var sMeta = metaMap[sAddr]
-        structure = structure.concat(root.structureClauses(sAddr, destination, sMeta, previousMeta))
-        geometry = geometry.concat(root.geometryClauses(sAddr, sMeta, monitor, occupied))
-        previousMeta = sMeta
-      }
-      root.pendingMoveClauses = structure.concat(geometry)
-      if (root.pendingMoveClauses.length === 0) return
-      moveCursorProcess.running = true
-      return
-    }
-
-    // 2+ representatives: hand off to the same decomposition sequencer
-    // stash() uses, targeting `destination` directly instead of the stash
-    // scratchpad — see finishMoveDecomposition() below for what happens
-    // once it completes.
     root.beginDecomposition(0, root.pendingMoveSourceWorkspace, representatives, grouped.representativeOf, destination, {
       purpose: "move",
       metaMap: metaMap,
