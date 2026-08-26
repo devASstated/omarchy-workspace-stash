@@ -1,0 +1,15 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+*.swp
+*.swo
+*~
+
+# Python (in case investigation/test scripts are ever added again)
+__pycache__/
+*.pyc
+
+# Claude Code local session state
+.claude/

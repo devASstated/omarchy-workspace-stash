@@ -953,3 +953,20 @@ now thread `peelOrder()`'s `unresolved` set into `geometryClauses()`.
 `LICENSE`, `README.md`, and `FEATURES.md` are current as of this update; `FEATURES.md`
 §8 now documents V3 as locked project contract rather than reserved
 direction.
+
+## 21. The accepted true-grid limitation, revisited
+
+Every entry above treats the true multi-branch case (§17, an actual 2×2
+grid or any two independently-split branches) as a deliberately accepted
+limitation, not a bug — `peelOrder()`/`isSeparated()` can only ever
+reconstruct a caterpillar tree, by design. That decision was later
+revisited on an experimental branch: a destructive-decomposition
+mechanism (remove one window at a time during stash, observe how the
+survivors compensate, reconstruct the tree from that transition record —
+not the single-snapshot parse §17 and `FEATURES.md` §7.4 describe)
+resolves genuine multi-branch layouts, real Hyprland groups, and
+pseudo-tiled windows the old ordering structurally could not. Full design
+and evidence: `docs/D-RECONSTRUCTION.md`. This entry is a forward pointer,
+not a rewrite — everything above remains an accurate record of what V1-V3
+actually shipped with, and why `peelOrder()` was the right call at the
+time.

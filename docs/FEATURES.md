@@ -320,7 +320,9 @@ Workspace Stash - Feature & Implementation Specification
 
 ### **7.5 V2 safety rule** 
 
-Layout reconstruction must be best-effort, never destructive. If the inferred tree is invalid, incomplete, or incompatible with the active layout, the plugin should restore all windows normally rather than refusing to restore the stash. Concretely: for the windows a batch's ordering can't structurally place (a true multi-branch layout — see §7.3), the plugin must not force their captured size onto whatever fallback order it picks, since that reliably collapses them; those windows fall back to Hyprland's own tiling instead. This rule applies equally to bulk workspace-move (§8.1), which reuses the same ordering and geometry logic. 
+Layout reconstruction must be best-effort, never destructive. If the inferred tree is invalid, incomplete, or incompatible with the active layout, the plugin should restore all windows normally rather than refusing to restore the stash. Concretely: for a batch reconstruction genuinely can't resolve, the plugin must not force captured sizes onto whatever fallback placement it picks, since that reliably collapses them; those windows fall back to Hyprland's own tiling instead. This rule applies equally to bulk workspace-move (§8.1), which reuses the same ordering and geometry logic.
+
+(Historical note: §7.3-7.4 describe the originally-proposed static-geometry reconstruction path. What actually shipped — destructive decomposition during stash, not a single-snapshot parse — resolves genuine multi-branch layouts, real Hyprland groups, and pseudo-tiled windows that the originally-proposed path structurally could not. This safety rule's *fallback* behavior is unchanged either way. See `docs/D-RECONSTRUCTION.md` for the mechanism that actually ships.) 
 
 ### **7.6 V2 compatibility** 
 

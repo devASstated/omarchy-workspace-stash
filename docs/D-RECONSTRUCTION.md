@@ -18,8 +18,9 @@ columns) doesn't fit that shape and was a documented, deliberately
 accepted limitation.
 
 Two mechanisms were investigated to close that gap, both validated
-against a live Hyprland session before either was trusted (raw
-methodology and every fixture: `docs/RECONSTRUCTION-EXPERIMENTS.md`).
+against a live Hyprland session before either was trusted — the raw
+feasibility-phase experiment log (every fixture, every gate) is
+preserved in `release-candidate`'s git history, not in this tree.
 
 ## Approach A: recursive bipartition (validated, not shipped)
 
@@ -252,8 +253,8 @@ authoritative pseudo-state API.
 ## Verification summary
 
 Feasibility phase (pre-implementation): 128+ live-compositor runs plus
-15 synthetic adversarial parser-safety cases — full methodology and raw
-results in `docs/RECONSTRUCTION-EXPERIMENTS.md`.
+15 synthetic adversarial parser-safety cases, full methodology and raw
+results preserved in `release-candidate`'s git history.
 
 Post-implementation: `qmllint`/`omarchy plugin validate .` clean
 throughout. A 19-case automated regression sweep (single window, single

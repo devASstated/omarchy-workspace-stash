@@ -1,16 +1,18 @@
 # Workspace Stash
 
-Workspace-level minimize/restore for Omarchy Quattro. A downward gesture (or
-a keyboard toggle) hides every window on the current workspace into one
-global stash; an upward gesture brings the whole accumulated stash back onto
-whichever workspace you're on when you ask for it. It is not a per-window
-minimize system — there is one stash, and restoring always gives you all of
-it.
+The "clean slate" button Hyprland doesn't have. One gesture (or keypress)
+tucks every window on your current workspace out of sight; the same gesture
+in reverse brings them all back — laid back out the way you left them.
 
-Hyprland does not provide conventional desktop minimization. Workspace Stash
-implements it by parking windows on a private `special:workspace-stash`
-workspace, using their exact Hyprland addresses to bring them back, and
-restoring their original layout on a best-effort basis.
+Think `git stash`, but for your desktop: there's one stash, not a slot per
+window. Stash again from a different workspace and it just adds to the
+pile; restore always brings everything back at once, wherever you currently
+are.
+
+Hyprland doesn't have conventional desktop minimization built in. Workspace
+Stash implements it by parking windows on a private `special:workspace-stash`
+workspace, remembering their exact Hyprland addresses to bring them back,
+and reconstructing their original layout when it restores them.
 
 ![Workspace Stash bar widget in count, names, and icons mode, plus the dimmed empty state](preview.png)
 
@@ -20,9 +22,9 @@ restoring their original layout on a best-effort basis.
   keypress, and restores the whole accumulated stash with another
 - Repeated stashes accumulate into the same stash rather than creating
   separate slots — restore always releases everything at once
-- Restores tiled windows in an order that reconstructs their original
-  Dwindle split structure, including relative split ratios, for common
-  layouts (see Limitations)
+- Reconstructs your original tiled layout on restore — including genuine
+  grids, real Hyprland groups, and pseudo-tiled windows, not just simple
+  side-by-side splits (see Limitations for the one case that isn't exact)
 - Restores floating windows to their exact captured position and size,
   clamped on-screen if the destination monitor is smaller than the one they
   were captured on
@@ -230,18 +232,16 @@ again the same way.
 
 ## Limitations
 
-- **Layout restoration is best-effort, not exact**, for tiled windows. Any
-  layout buildable one window at a time — a straight sequence of splits, or
-  a lone window alongside a stacked/grouped set, however many windows deep —
-  restores reliably, including split ratios. A genuinely multi-branch
-  layout, where two *independently*-split groups sit side by side (a true
-  2×2 grid is the clearest example), isn't reliably reconstructed: Hyprland
-  may fall back to tiling those windows in a different arrangement. Nothing
-  is lost or hidden in this case — every window still comes back — only its
-  exact position/size may differ from where it was.
-- **The stash is global**, not per-workspace. Repeated stash gestures from
-  different workspaces accumulate into the same stash; there's no way to
-  restore only one previous stash operation.
+- **Layout restoration is best-effort, not guaranteed**, for tiled windows.
+  In the very rare case a batch's layout genuinely can't be reconstructed,
+  every window still comes back — restoration falls back to Hyprland's own
+  tiling rather than forcing a wrong layout — only the exact position/size
+  may differ from where it was. Nothing is ever lost or hidden.
+- **Two directly-adjacent pseudo-tiled windows** (`SUPER+P`, both siblings
+  in the same split) may not both restore their exact size — Hyprland
+  itself recomputes a pseudo-tiled window's natural size when it's touched
+  while its sibling is also pseudo-tiled. Structure, order, and every other
+  window are unaffected; this is narrow and purely cosmetic.
 - **The originally-focused window isn't guaranteed to end up focused again**
   after a restore, especially when several windows are involved.
 - **No cross-session persistence.** The stash lives in Hyprland's live
@@ -258,9 +258,10 @@ omarchy plugin validate .
 qmllint Service.qml BarWidget.qml
 ```
 
-See `docs/FEATURES.md` for the full behavioral specification and
+See `docs/FEATURES.md` for the full behavioral specification,
 `docs/DESIGN-JOURNEY.md` for the history of how the implementation reached
-it, including the bugs found and rejected approaches along the way.
+it (bugs found and rejected approaches along the way), and
+`docs/D-RECONSTRUCTION.md` for how layout reconstruction actually works.
 
 ## License
 

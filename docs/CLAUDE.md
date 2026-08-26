@@ -52,9 +52,10 @@ culminating in `release-candidate` (branched from
 `experiment/d-unified-pipeline`), where genuine multi-branch layouts —
 grids, real Hyprland groups, pseudo-tiled windows — reconstruct
 correctly for `stash()`/`restore()`/`moveWorkspaceTo()` alike. Full
-design, mechanism, and evidence: `docs/D-RECONSTRUCTION.md` (start
-there before touching any reconstruction code); raw feasibility-phase
-methodology and results: `docs/RECONSTRUCTION-EXPERIMENTS.md`. The
+design, mechanism, and evidence: `docs/D-RECONSTRUCTION.md` — start
+there before touching any reconstruction code. (The raw feasibility
+-phase experiment log this was validated against isn't part of this
+tree; it's preserved in `release-candidate`'s own git history.) The
 old flat/geometric-ordering fallback (`peelOrder()`, `isSeparated()`,
 `orderDescriptors()`, `restoreOrder()`, `sortByRowThenX()`) has been
 deleted on `release-candidate` — confirmed fully unreachable before
