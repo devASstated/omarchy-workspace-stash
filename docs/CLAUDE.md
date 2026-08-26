@@ -16,12 +16,6 @@ covers. There is no reserved-but-unbuilt scope left in this project as of
 this note; treat any further feature work as a new request to scope from
 scratch, not a continuation of an existing plan.
 
-One exception: `docs/RECONSTRUCTION.md` is an approved *design* (no code
-written yet) for replacing the layout-reconstruction limitation described
-below. It's scoped to a dedicated experimental branch, not `main` — see
-the "layout-reconstruction limitation" note further down for exactly what
-that means and what to read before touching any of it.
-
 Two behaviors worth knowing before touching restore/move code again:
 
 - Restoring or bulk-moving windows must never move the mouse cursor as a
@@ -36,87 +30,47 @@ Two behaviors worth knowing before touching restore/move code again:
   takes a `skipTiledResize` flag for exactly this case — when the
   destination is occupied, tiled windows skip their absolute-resize clause
   and let Hyprland's own tiling settle them.
-- `restoreOrder()`/`orderDescriptors()` no longer just sort by row/x.
-  `peelOrder()` repeatedly peels off whichever window is fully separated
-  from the rest (`isSeparated()`, geometric, using `rowTolerance` slack),
-  outermost first, to reconstruct any "caterpillar" tree — every tree
-  `structureClauses()` can actually build, since each insert can only split
-  the single most-recently-placed window. This was a real bug fix (see
-  `docs/DESIGN-JOURNEY.md` §20's ordering-bug entry, found from a live user
-  repro), not a rewrite for its own sake — don't revert to a flat sort
-  without rereading why.
 - Which side a new window lands on relative to its predecessor is
   Dwindle's own default heuristic unless overridden. `structureClauses()`
-  now issues `hl.dsp.layout("preselect l|r|u|d")` before each non-first
+  issues `hl.dsp.layout("preselect l|r|u|d")` before each non-first
   window's move/focus, direction from `preselectDirection()` against the
-  immediately-previous window in the resolved order. Confirmed live, not
-  just from the Lua stub — see `docs/DESIGN-JOURNEY.md` §20.
+  anchor window it's being placed relative to. Confirmed live, not just
+  from the Lua stub — see `docs/DESIGN-JOURNEY.md` §20.
 
-The layout-reconstruction limitation (`docs/DESIGN-JOURNEY.md` §17,
-narrowed by §20) is still fully in effect on `main`: a genuinely
-multi-branch layout — an actual 2×2 grid, two independently-split columns —
-isn't reliably reconstructed today, because that requires the full
-split-tree inference `docs/FEATURES.md` §7.4 already named as hard and this
-project originally chose not to build. This is narrower than it used to
-be: the "lone window plus a stacked pair" case that looked like the same
-problem turned out to be fixable (see `peelOrder()` above) because it's
-still a caterpillar tree, just one the old sort ordered wrong. The
-remaining boundary was found, investigated, and explicitly accepted on
-`main` — twice reconfirmed by the project owner as of that decision, not
-an oversight.
+### Layout reconstruction
 
-That decision has since been revisited, and the resulting design has
-since been tested live — 128 real Hyprland runs plus targeted
-investigation of groups, pseudo-tiling, floating windows, occupied
-destinations, and multi-batch restore, all on the
-`experiment/tree-bipartition-restore` branch, none of it merged or
-touching `main`. `docs/RECONSTRUCTION.md` is the tested design;
-`docs/RECONSTRUCTION-EXPERIMENTS.md` is the full evidence trail and the
-resulting implementation checklist. The crux, compressed: Hyprland's
-Dwindle can only ever build a layout via full-span cuts of a focused
-container, so any layout it produced is guaranteed reconstructible by
-recursively cutting the *whole remaining group* into two non-empty
-pieces — not just peeling one fully-separable window off the outside,
-which is all `peelOrder()`/`isSeparated()` do today. The classifier alone
-isn't enough, though: §17 shows the actual dispatch loop only ever splits
-relative to one global "last window placed," so it can only ever build a
-linear chain; the insertion/dispatch sequencing has to change too — not,
-as first sketched and never built, to a per-subtree anchor tracked during
-a recursive walk, but to **representative-leaf preorder expansion**: give
-every subtree one fixed representative window, place a subtree's two
-representatives as a pair before recursing into either side. That's the
-mechanism that was actually tested — 40/40 on the first pass, holding
-across every later gate — so it's what `docs/RECONSTRUCTION.md` now
-describes; the anchor sketch never got built and shouldn't be. Read
-`docs/RECONSTRUCTION.md` in full before implementing any part of this —
-it has the idea-level reasoning, the data-flow, and a function-by
--function map of exactly what's new, modified, and untouched
-(`structureClauses()`, `geometryClauses()`, and the actual
-`hyprctl --batch` dispatch stay unchanged either way).
+`main` still has the original limitation: a genuinely multi-branch
+layout (an actual 2×2 grid, two independently-split columns) isn't
+reliably reconstructed there, because it requires full split-tree
+inference (`docs/FEATURES.md` §7.4), which the project originally chose
+not to build (`docs/DESIGN-JOURNEY.md` §17, narrowed by §20). Do not
+change `structureClauses()`/`geometryClauses()`/restore ordering on
+`main` to address this without raising it in conversation first.
 
-If you're reading this on `main` and the experimental branch above doesn't
-exist yet or hasn't been merged, treat the original instruction as still
-fully active: do not change
-`restoreOrder()`/`structureClauses()`/`geometryClauses()` to address this
-limitation without raising it in conversation first, and implement any of
-it only on the dedicated branch, never directly on `main`.
+That decision has since been revisited on experimental branches,
+culminating in `release-candidate` (branched from
+`experiment/d-unified-pipeline`), where genuine multi-branch layouts —
+grids, real Hyprland groups, pseudo-tiled windows — reconstruct
+correctly for `stash()`/`restore()`/`moveWorkspaceTo()` alike. Full
+design, mechanism, and evidence: `docs/D-RECONSTRUCTION.md` (start
+there before touching any reconstruction code); raw feasibility-phase
+methodology and results: `docs/RECONSTRUCTION-EXPERIMENTS.md`. The
+old flat/geometric-ordering fallback (`peelOrder()`, `isSeparated()`,
+`orderDescriptors()`, `restoreOrder()`, `sortByRowThenX()`) has been
+deleted on `release-candidate` — confirmed fully unreachable before
+removal — not merely deprecated; a batch the new mechanism can't
+resolve now uses natural placement instead (see
+`docs/D-RECONSTRUCTION.md`).
 
-A second, narrower, deliberately-accepted limitation was found and
-investigated on `experiment/d-unified-pipeline`
-(`docs/DUAL-PSEUDO-GEOMETRY-INVESTIGATION.md`): exact geometry
-restoration is not guaranteed when two directly sibling tiled windows
-are both pseudo-tiled — Hyprland may recompute a pseudo-tiled client's
-natural surface size the moment it's touched during replay, even by
-reasserting its own already-correct captured size, so this isn't fixable
-by reordering dispatch clauses. Topology, window safety, and operation
-completion are all unaffected; only that one window's exact surface size
-isn't guaranteed. Deliberately left unfixed — the fix would require
-capturing/persisting pseudo state and threading sibling-awareness through
-`geometryClauses()`, exactly the kind of special-case machinery the
-unified-D refactor (`docs/D-UNIFIED-PIPELINE-COMPARISON.md`) was written
-to eliminate, for a rare, cosmetic-only precondition. Revisit only if
-real usage hits it often enough to matter, or Hyprland exposes a clean
-authoritative pseudo-state API.
+One narrower, deliberately-accepted limitation from that work: exact
+geometry restoration is not guaranteed when two directly sibling tiled
+windows are both pseudo-tiled (a genuine Hyprland compositor behavior,
+not a dispatch-ordering bug — see `docs/D-RECONSTRUCTION.md` for the
+investigation and why it's left unfixed).
+
+This is scoped to experimental branches, not `main` — treat `main` as
+still governed by the paragraph above until this work is actually
+merged.
 
 Priorities:
 

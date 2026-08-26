@@ -1,12 +1,11 @@
 # Reconstruction feasibility — experiment log (Gate 1 & Gate 2)
 
 This document records what was actually run against a live Hyprland
-session on `experiment/tree-bipartition-restore`, why, and what the
-results were — written for independent cross-review, not as a design
-document. For the design being tested, read `docs/RECONSTRUCTION.md`
-first; for the fuller menu of approaches this picks from, read
-`docs/workspace_stash_reconstruction_feasibility_plan.docx` (§0–§14; the
-gate numbering below is that document's own).
+session during the feasibility phase, why, and what the results were —
+written for independent cross-review, not as a design document. For
+what this evidence led to (the mechanism that shipped, and why), read
+`docs/D-RECONSTRUCTION.md`. Gate numbering below reflects the original
+menu of approaches this picked from, evaluated during the same phase.
 
 No production code was touched. Everything here lives in `experiments/`,
 which `manifest.json`'s `entryPoints` never reference, so none of it ships
