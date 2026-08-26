@@ -250,30 +250,38 @@ BarWidget {
 
     // Stack glyph: a small drawn pictogram rather than a font icon, so the
     // widget doesn't depend on a specific Nerd Font codepoint being
-    // present. Three filled bars, leaning diagonally — reads as a small
-    // stack of layers (git's own stash is a LIFO stack) without the
-    // bordered-box version's visual weight. Dimmed while the stash is
-    // empty, full opacity once something's stashed; same shape either way.
+    // present. Three plain rectangles stacked diagonally toward the
+    // top-right, each layer dimmer than the one in front — echoes the
+    // common "multiple windows" stack icon (e.g. Windows' Task View)
+    // rather than a document/page metaphor, since what's stashed is
+    // windows, not files. Depth comes from solid Qt.darker() colors, not
+    // opacity, matching this shell's own convention for a dimmed icon
+    // (see tailscale's/dropbox's panels) — semi-transparent siblings that
+    // overlap compound their alpha where they cross, visibly brightening
+    // that seam instead of receding; solid colors just paint over each
+    // other. layer.enabled forces the whole glyph to composite once
+    // before the empty-state opacity applies, for the same reason.
     Item {
-      width: Style.space(12)
-      height: Style.space(7)
+      width: Style.space(14)
+      height: Style.space(11)
       anchors.verticalCenter: parent.verticalCenter
+      layer.enabled: true
       opacity: root.hasStash ? 1.0 : 0.38
       Behavior on opacity { NumberAnimation { duration: 120 } }
 
       Repeater {
         model: [
-          { x: 2, y: 0 },
-          { x: 1, y: 3 },
-          { x: 0, y: 6 }
+          { x: 0, y: 5, darker: 2.6 },
+          { x: 2, y: 2.5, darker: 1.6 },
+          { x: 4, y: 0, darker: 1.0 }
         ]
         Rectangle {
           x: Style.spaceReal(modelData.x)
           y: Style.spaceReal(modelData.y)
           width: Style.space(10)
-          height: Math.max(1, Style.spaceReal(1))
+          height: Style.spaceReal(5.5)
           radius: 0
-          color: root.bar ? root.bar.barForeground : Color.foreground
+          color: Qt.darker(root.bar ? root.bar.barForeground : Color.foreground, modelData.darker)
         }
       }
     }
