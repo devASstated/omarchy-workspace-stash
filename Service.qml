@@ -3,16 +3,10 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Hyprland
 
-// State owner for Workspace Stash. Hyprland is the source of truth for which
-// windows are currently stashed: a window is "in the stash" iff it is a live
-// Hyprland toplevel parked on stashWorkspace. `meta` below is auxiliary V2
-// bookkeeping (pre-move geometry, batch id, source workspace) only — it is
-// never consulted to decide membership, so it can never drift into a second
-// authoritative state. Entries are removed explicitly, not by polling "is
-// this still parked": restore() drops an address's entry the moment it
-// restores it, and pruneMeta() drops one only once its window is gone for
-// good (closed) — see pruneMeta() for why "currently parked" specifically
-// was the wrong condition to key that on.
+// State owner for Workspace Stash. Hyprland is the source of truth for
+// membership: a window is "in the stash" iff it's a live toplevel parked
+// on stashWorkspace. `meta` is auxiliary bookkeeping only (geometry,
+// batch id, source workspace) — never consulted to decide membership.
 Item {
   id: root
 
@@ -50,16 +44,10 @@ Item {
     return str.length > maxLength ? str.slice(0, maxLength) : str
   }
 
-  // hyprctl's own reply to "-j clients" embeds the same untrusted window
-  // titles/classes as above, and Quickshell's StdioCollector fully buffers
-  // it in memory before anything gets a chance to parse it — the clip
-  // above only bounds what reaches QML, not what's collected from the
-  // process in the first place. This bounds that raw collection itself
-  // (see stashCaptureOutput/moveCaptureOutput below), so a misbehaving
-  // window can't force an arbitrarily large in-memory buffer even before
-  // parsing. A real "hyprctl -j clients" here runs ~2KB; this leaves
-  // generous headroom for legitimate use while still refusing truly
-  // pathological output.
+  // Bounds the raw "hyprctl -j clients" output itself, before parsing —
+  // StdioCollector buffers it fully in memory, and clipText() above only
+  // bounds what reaches QML after the fact. A real capture here runs ~2KB;
+  // this leaves generous headroom while refusing pathological output.
   readonly property int maxCaptureBytes: 4194304
 
   // Presentation-ready snapshot for the bar widget: identity and live display
@@ -78,19 +66,12 @@ Item {
     }
   })
 
-  // Drop auxiliary entries for windows that no longer exist at all (closed
-  // while hidden). Deliberately keyed on "does this window still exist
-  // anywhere" (root.meta vs. the full toplevel list), not "is it currently
-  // parked in the stash" (root.meta vs. stashedToplevels): stash()'s own
-  // moveAddress() calls land in Hyprland one at a time, asynchronously, so
-  // stashedToplevels updates window-by-window as each move is actually
-  // applied. Keying prune on stashedToplevels pruned a freshly-stashed
-  // window's own meta entry the instant a *different* window in the same
-  // batch happened to land first — confirmed in testing to silently wipe
-  // 2 of 3 windows' captured geometry/order data on every multi-window
-  // stash. A window only needs pruning once it's gone for good, i.e. no
-  // longer a toplevel anywhere — moving between workspaces never removes
-  // it from that list, only closing it does.
+  // Drop meta entries for windows that no longer exist anywhere. Keyed on
+  // "still a toplevel anywhere", not "still parked in the stash" — keying
+  // on stashedToplevels pruned a freshly-stashed window's entry the
+  // instant a sibling in the same batch landed first, wiping most of a
+  // multi-window stash's data. Moving workspaces never drops a window
+  // from the toplevel list, only closing it does.
   function pruneMeta() {
     var live = {}
     var values = Hyprland.toplevels && Hyprland.toplevels.values ? Hyprland.toplevels.values : []
@@ -129,8 +110,7 @@ Item {
   // window lands where `meta` says it actually sat relative to `reference`
   // — the window it's about to split off (see structureClauses() below).
   // Whichever axis has the larger absolute offset is treated as the split
-  // axis, the same assumption isSeparated() above makes about sibling
-  // rectangles.
+  // axis.
   function preselectDirection(meta, reference) {
     var dx = meta.x - reference.x
     var dy = meta.y - reference.y
@@ -138,42 +118,16 @@ Item {
     return dy < 0 ? "u" : "d"
   }
 
-  // Phase 1 of restoring one window: place it and, for a tiled window,
-  // focus it so the *next* window's insertion splits against it (see
-  // restoreOrder() below). Deliberately builds only the tree topology —
-  // no sizing here. See geometryClauses() below for why that has to wait
-  // until every window's structureClauses() has already run.
-  //
-  // `previousMeta` is the last tiled window placed before this one (null
-  // for the first), used to preselect which side of it this window should
-  // land on via `hl.dsp.layout("preselect ...")` — confirmed live to
-  // control Dwindle's split direction for the next inserted window.
-  // Without it, order and size reconstruct correctly but left/right or
-  // top/bottom placement is whatever Dwindle's own default heuristic
-  // picks, which doesn't necessarily match the captured layout (found from
-  // a live report: topology and size were right, but a lone window and a
-  // stacked pair could still come back mirrored to the opposite side).
-  //
-  // Returns clauses to be collected and fired as ONE combined `hyprctl
-  // --batch` call across the *whole* restore (see restore() below), not
-  // dispatched per window: separate per-window processes, even each
-  // individually batched, aren't guaranteed to reach Hyprland in the
-  // order they were spawned in — OS process scheduling doesn't promise
-  // that — so under fast repeated restores a later window's move could
-  // land before an earlier one's focus, silently reassigning which
-  // window ends up in which split. One process for the entire sequence
-  // removes that cross-window ordering gap. (stash() doesn't need this —
-  // moveAddress() alone is enough there, since park order in the hidden
-  // workspace is never read back.)
-  // `previousAddress`: optional. The flat/caterpillar loop below never
-  // passes it — each step's `previousMeta` is always the immediately
-  // -preceding dispatch, so Hyprland's own currently-focused window
-  // already matches it for free. The representative-leaf tree-walk
-  // (walkAndDispatch() below) routinely needs to refocus a window from
-  // several steps back, which is *not* what's currently focused — passing
-  // `previousAddress` adds an explicit refocus clause first. Harmless and
-  // redundant when the target's already focused (the flat case, if it
-  // were ever passed there), load-bearing for the tree-walk.
+  // Place one window and, if tiled, focus it so the next insertion splits
+  // against it — see walkAndDispatch() below. No sizing here (separate
+  // pass, see geometryClauses()). `previousMeta` is the anchor to
+  // preselect against (null for the first window) — without it,
+  // left/right or top/bottom placement follows Dwindle's default instead
+  // of the captured layout. Callers fire all clauses as ONE `hyprctl
+  // --batch`, not per window — separate processes aren't guaranteed to
+  // reach Hyprland in order. `previousAddress` is only needed to refocus a
+  // window from several steps back (the tree-walk case); the flat case
+  // never passes it since `previousMeta` is already the last dispatch.
   function structureClauses(address, destination, meta, previousMeta, previousAddress) {
     if (!address || !destination) return []
     var move = "hl.dsp.window.move({ workspace = " + JSON.stringify(destination)
@@ -190,28 +144,14 @@ Item {
     return [preselect, move, focus].map(root.dispatchClause)
   }
 
-  // Phase 2: restore captured size (and, for floating, position) — for
-  // every window, tiled or not, using the exact same absolute resize
-  // dispatch either way (confirmed empirically: Dwindle accepts an
-  // absolute { x = width, y = height } resize on a tiled window the same
-  // as a floating one, adjusting its sibling to compensate). This has to
-  // run only after ALL of this restore's structureClauses() have already
-  // been dispatched, not interleaved per window: Dwindle re-splits evenly
-  // whenever a new window is inserted, so resizing window N to its
-  // captured ratio and *then* inserting window N+1 would just reset N
-  // back to an even split. Building the whole tree first and sizing
-  // everything after avoids that.
-  //
-  // skipTiledResize: when the destination already had other windows on
-  // it, the incoming group lands one level deeper in the split tree than
-  // whatever it was captured at (existing window, then the incoming
-  // chain, rather than just the incoming chain alone) — captured absolute
-  // sizes stop adding up for that deeper nesting, and forcing them anyway
-  // produced windows squeezed down to a handful of pixels, confirmed
-  // empirically. Tiled ratio-restore is skipped in that case and Hyprland
-  // is left to size the merge naturally instead; floating restore is
-  // unaffected either way, since a floating window's position/size never
-  // depends on sibling tree structure.
+  // Restore captured size (and, for floating, position) — one absolute
+  // resize dispatch for tiled and floating alike. Must run only after
+  // every structureClauses() in this restore has dispatched: Dwindle
+  // re-splits evenly on each insertion, so resizing window N before
+  // inserting N+1 would just get reset. skipTiledResize: forcing captured
+  // sizes when merging onto an occupied destination (or unrelated batch)
+  // squeezes windows to a handful of pixels — skipped in that case, and
+  // Hyprland settles the merge naturally instead.
   function geometryClauses(address, meta, monitor, skipTiledResize) {
     if (!address || !meta || !(meta.width > 0) || !(meta.height > 0)) return []
     var resize = "hl.dsp.window.resize({ x = " + Math.round(meta.width)
@@ -237,161 +177,12 @@ Item {
     }
   }
 
-  // Best-effort restore order for tiled windows: Dwindle derives its split
-  // tree from insertion order. structureClauses() can only ever build a
-  // "caterpillar" tree — each insert splits off exactly one leaf from
-  // whichever window was most recently placed — so the goal here isn't
-  // full split-tree inference (docs/FEATURES.md §7.3-7.4 on why that's
-  // hard and still out of scope), just finding the one insertion order
-  // that reproduces the actual caterpillar shape when the layout is one.
-  // Batches restore oldest first; within a batch, peelOrder() (below)
-  // does the real ordering work. A window with no surviving meta (e.g. a
-  // shell restart wiped it) sorts as batch 0 — i.e. today's unordered
-  // behavior, the intended fallback when there's nothing to order by.
-  //
-  // Order alone isn't enough, though: Dwindle splits whichever tiled
-  // window is currently *active*, not just "the last one inserted", so
-  // restore() also has to focus each tiled window right after moving it
-  // in (see structureClauses() above) to keep that active-window chain
-  // matching what it was during the original stash. Tested without that
-  // focus step, order alone reproduced the original layout for 2 windows
-  // but reliably scrambled it for 3+. It also doesn't touch size at all —
-  // see geometryClauses() above for why ratio restoration has to be a
-  // fully separate pass, run only after every window's structure is
-  // already in place.
-  //
-  // Windows sharing a tile don't always report exactly the same y — a
-  // grouped/tabbed window's captured y sits a bit lower than an ungrouped
-  // neighbor at the same visual row, because the group's tab bar pushes
-  // its content down (confirmed empirically: ~28px for a 2-tab group).
-  // Treating that as "a different row" ranked the group after a window
-  // that was actually to its right, swapping their left/right placement
-  // on restore even though the group itself stayed intact. rowTolerance
-  // absorbs that kind of minor chrome offset (tab bars, borders, gaps)
-  // without being wide enough to blur two genuinely stacked windows into
-  // the same row. The same tolerance also absorbs it in isSeparated()
-  // below, for the same reason.
-  readonly property int rowTolerance: 40
-
-  // Fallback/tie-break order: reading order (row, then column). Used to
-  // seed peelOrder() below and to order whatever peelOrder can't resolve.
-  function sortByRowThenX(list) {
-    return list.slice().sort(function(a, b) {
-      if (Math.abs(a.y - b.y) > root.rowTolerance) return a.y - b.y
-      return a.x - b.x
-    })
-  }
-
-  // True if `candidate` sits entirely to one side of every window in
-  // `others` along either axis — i.e. a single full-span vertical or
-  // horizontal line could separate it from the rest. That's exactly what
-  // the *outermost* split of a caterpillar tree looks like (one lone
-  // window against everything else, which is itself further split), so
-  // it's the geometric signal peelOrder() uses to find what to place — and
-  // therefore insert — next.
-  function isSeparated(candidate, others) {
-    var tol = root.rowTolerance
-    var fullyLeft = true, fullyRight = true, fullyAbove = true, fullyBelow = true
-    for (var i = 0; i < others.length; i++) {
-      var o = others[i]
-      if (candidate.x + candidate.width > o.x + tol) fullyLeft = false
-      if (candidate.x < o.x + o.width - tol) fullyRight = false
-      if (candidate.y + candidate.height > o.y + tol) fullyAbove = false
-      if (candidate.y < o.y + o.height - tol) fullyBelow = false
-    }
-    return fullyLeft || fullyRight || fullyAbove || fullyBelow
-  }
-
-  // Repeatedly peels off one fully-separated window at a time, outermost
-  // first, reconstructing the insertion order for any caterpillar-shaped
-  // layout — including "one window alone, the rest grouped together",
-  // which the old flat row/x sort got wrong whenever the lone window
-  // happened to sort ahead of only part of the group (see
-  // docs/DESIGN-JOURNEY.md §20 for the live repro that found this). Stops
-  // the moment nothing left can be cleanly peeled off — a true grid layout
-  // (docs/DESIGN-JOURNEY.md §17, e.g. two independently-split branches)
-  // isn't a caterpillar, so whatever's still in `remaining` at that point
-  // is returned separately as `unresolved`: those specific windows get a
-  // reading-order placement rather than a structurally-correct one, and
-  // the caller uses that to skip forcing their captured size (see
-  // geometryClauses()'s skipTiledResize) rather than squeezing them to fit
-  // a tree that no longer matches reality.
-  function peelOrder(group) {
-    var order = []
-    var remaining = root.sortByRowThenX(group)
-    var stalled = false
-    while (remaining.length > 1) {
-      var leafIndex = -1
-      for (var i = 0; i < remaining.length; i++) {
-        var others = remaining.slice(0, i).concat(remaining.slice(i + 1))
-        if (root.isSeparated(remaining[i], others)) { leafIndex = i; break }
-      }
-      if (leafIndex === -1) { stalled = true; break }
-      order.push(remaining[leafIndex])
-      remaining.splice(leafIndex, 1)
-    }
-    // A single leftover leaf here is the normal end state for a fully
-    // resolved caterpillar, not a failure — only mark `unresolved` when
-    // the loop above actually stalled with 2+ windows still ungrouped.
-    var trailing = root.sortByRowThenX(remaining)
-    return { order: order.concat(trailing), unresolved: stalled ? trailing : [] }
-  }
-
-  // Sorts plain window descriptors, not addresses — the reusable half of
-  // restoreOrder() below. Extracted so moveWorkspaceTo() (see below) can
-  // apply the exact same best-effort ordering without ever touching
-  // root.meta, since staying orthogonal to the stash is its whole premise.
-  // Returns { order, unresolved } — unresolved is an address->true map of
-  // windows peelOrder() couldn't place structurally (a true grid batch;
-  // see peelOrder() above), for the caller to skip absolute resize on.
-  function orderDescriptors(descriptors) {
-    var byBatch = {}
-    var batchIds = []
-    for (var i = 0; i < descriptors.length; i++) {
-      var d = descriptors[i]
-      if (!byBatch[d.batchId]) { byBatch[d.batchId] = []; batchIds.push(d.batchId) }
-      byBatch[d.batchId].push(d)
-    }
-    batchIds.sort(function(a, b) { return a - b })
-
-    var order = []
-    var unresolved = {}
-    for (var b = 0; b < batchIds.length; b++) {
-      var peeled = root.peelOrder(byBatch[batchIds[b]])
-      order = order.concat(peeled.order)
-      for (var u = 0; u < peeled.unresolved.length; u++) unresolved[peeled.unresolved[u].address] = true
-    }
-    return { order: order, unresolved: unresolved }
-  }
-
-  // Returns { addresses, unresolved } — see orderDescriptors() above.
-  function restoreOrder(addresses) {
-    var meta = root.meta
-    var descriptors = addresses.map(function(address) {
-      var m = meta[address] || null
-      return {
-        address: address,
-        batchId: m ? m.batchId : 0,
-        x: m ? m.x : 0,
-        y: m ? m.y : 0,
-        width: m ? m.width : 0,
-        height: m ? m.height : 0
-      }
-    })
-    var result = root.orderDescriptors(descriptors)
-    return { addresses: result.order.map(function(d) { return d.address }), unresolved: result.unresolved }
-  }
-
   // ============================================================
   // D reconstruction: destructive decomposition during stash,
-  // representative-leaf replay during restore. See
-  // docs/D-ONLY-IMPLEMENTATION-PLAN.md for the full design and
-  // docs/RECONSTRUCTION-EXPERIMENTS.md for the evidence trail — every
-  // mechanism below was proven live (128+ compositor runs) before being
-  // ported here, including several real bugs found and fixed during that
-  // process (documented at each fix site below). `peelOrder()`/
-  // `isSeparated()` above stay in the file, reachable as the fallback
-  // for any batch this can't resolve — never deleted by this change.
+  // representative-leaf replay during restore. Every tiled batch goes
+  // through this pipeline; a batch it can't resolve uses natural
+  // placement (see finishRestore()) rather than a weaker fallback
+  // guessing an order. Design/evidence: docs/D-RECONSTRUCTION.md.
   // ============================================================
 
   // Batch-level reconstructed trees live here, not in root.meta — a tree
@@ -402,11 +193,9 @@ Item {
   property var batchPlans: ({})
 
   // Held for the *entire* decomposition sequence, not just the initial
-  // capture: stash()'s pre-existing busy-check only covers
-  // stashCaptureProcess, which exits quickly — the sequencer that follows
-  // can run for many async steps, and a second stash/restore/move
-  // triggered mid-sequence must be rejected the same way today's other
-  // "busy" cases already are, not race against in-flight state.
+  // capture — the sequencer can run for many async steps, and a second
+  // stash/restore/move triggered mid-sequence must be rejected as "busy",
+  // not race against in-flight state.
   property bool decompositionInFlight: false
 
   function isAddressLive(address) {
@@ -493,13 +282,9 @@ Item {
   }
 
   // Infers which axis a removed window was adjacent to the surviving
-  // cluster along, from the BEFORE snapshot alone — deliberately does not
-  // depend on the cluster resizing afterward. An earlier version compared
-  // bounding-box size deltas instead and broke on real pseudo-tiled
-  // windows: they re-center within a larger slot without resizing into
-  // it, so both size deltas can be zero even though the window plainly
-  // moved. Fixed by comparing overlap on each axis instead, which stays
-  // well-defined regardless of whether the surviving side resizes.
+  // cluster along, from the BEFORE snapshot alone — doesn't depend on the
+  // cluster resizing afterward (comparing size deltas instead broke on
+  // pseudo-tiled windows, which can re-center without resizing).
   function inferAxisAndDirection(removedRect, clusterBbox) {
     var xOverlap = Math.min(removedRect.x + removedRect.width, clusterBbox.x + clusterBbox.width) - Math.max(removedRect.x, clusterBbox.x)
     var yOverlap = Math.min(removedRect.y + removedRect.height, clusterBbox.y + clusterBbox.height) - Math.max(removedRect.y, clusterBbox.y)
@@ -513,15 +298,11 @@ Item {
     return addressList.slice().sort().join(",")
   }
 
-  // Worklist reconstruction: repeatedly resolves whichever pending
-  // transition-record entry currently has all its `changed` addresses in
-  // one already-built group, restarting the scan from the beginning after
-  // every merge. That restart is load-bearing, not defensive styling — a
-  // plain single-pass scan can resolve a later-recorded entry before an
-  // earlier one gets a chance at the same group, silently locking in a
-  // structurally wrong (but plausible-looking) tree — found live on a
-  // real 6-window fixture during testing. Returns { tree } or { error }
-  // — never a best-guess wrong tree.
+  // Worklist reconstruction: resolve whichever pending record entry has
+  // all its `changed` addresses in one already-built group, restarting
+  // the scan after every merge (load-bearing — a single pass can resolve
+  // a later entry first and lock in a wrong tree). Returns { tree } or
+  // { error }, never a best-guess wrong tree.
   function reconstructTree(record, addresses, groupMembersByAddress) {
     var node = {}
     var groupOf = {}
@@ -606,20 +387,13 @@ Item {
     return node.isLeaf ? node : root.representativeOfNode(node.first)
   }
 
-  // Representative-leaf preorder expansion, replacing the flat
-  // previousMeta-threaded loop for any batch with a resolved tree: place a
-  // subtree's two representatives as a pair before recursing into either
-  // side. Proven 128/128 across every orientation, ratio, and window
-  // count tested. `skipTiledResizeFor(address)` mirrors the existing
-  // `occupied || unresolved[address]` decision, just as a function so the
-  // caller can vary it per address if needed. `incomingMeta`/
-  // `incomingAddress` are the cross-batch anchor (see finishRestore()) —
-  // null for the very first batch. `metaMap` defaults to `root.meta` when
-  // omitted (every existing call site) — moveWorkspaceTo()'s extension
-  // passes its own local, immutable source-snapshot map instead, since it
-  // deliberately never reads or writes root.meta (see finishMoveWorkspace()
-  // below). Returns { structure, geometry, lastMeta, lastAddress } — the
-  // last two are the outgoing anchor for whatever batch comes next.
+  // Representative-leaf preorder expansion: place a subtree's two
+  // representatives as a pair before recursing into either side.
+  // `incomingMeta`/`incomingAddress` are the cross-batch anchor (null for
+  // the first batch). `metaMap` defaults to root.meta when omitted —
+  // moveWorkspaceTo() passes its own local snapshot instead. Returns
+  // { structure, geometry, lastMeta, lastAddress }, the last two being
+  // the outgoing anchor for the next batch.
   function walkAndDispatch(tree, destination, monitor, skipTiledResizeFor, incomingMeta, incomingAddress, metaMap) {
     var meta = metaMap || root.meta
     var structure = []
@@ -652,16 +426,11 @@ Item {
     return { structure: structure, geometry: geometry, lastMeta: lastMeta, lastAddress: lastAddress }
   }
 
-  // Stale-tree pruning: a window can close *after* a successful stash,
-  // while just sitting in the stash workspace, before restore is ever
-  // called — leaving a stored tree referencing a now-dead address. Hooked
-  // into the same trigger pruneMeta() already uses (every live-toplevel
-  // -list change, i.e. every window close anywhere). A genuine tree edit,
-  // not a blanket invalidation: find the dead leaf, replace its *parent*
-  // Split with the leaf's *sibling* subtree (standard binary-tree leaf
-  // removal, promoting the sibling up one level) — the same "the tree
-  // closes over a removed leaf" operation the decomposition sequencer
-  // already embodies, just applied after the fact.
+  // Stale-tree pruning: a stashed window can close before restore() is
+  // ever called, leaving a stored tree referencing a dead address. Hooked
+  // into the same trigger pruneMeta() uses. A genuine tree edit, not a
+  // blanket invalidation: find the dead leaf, replace its parent Split
+  // with the leaf's sibling subtree (standard binary-tree leaf removal).
   function pruneNodeForDeadAddress(node) {
     // Returns { node, removed } — removed is true if this call's own
     // level found and excised a dead leaf (caller promotes the sibling).
@@ -725,29 +494,15 @@ Item {
   property var pendingDecomposition: null
 
   // Kicks off D's destructive decomposition for one batch's tiled,
-  // group-collapsed representative addresses — the moves themselves ARE
-  // the stash (confirmed live in the seam integration test: not a probe
-  // followed by a separate stash pass). Every destructive per-step move
-  // (and the final survivor move) always transits through
-  // root.stashWorkspace, regardless of caller — confirmed live this has
-  // to stay true even for moveWorkspaceTo()'s extension below: redispatching
-  // the tree-replay's move/focus/preselect sequence against windows already
-  // sitting on the *real* final destination does not reproduce the same
-  // Dwindle insertion behavior (it was tried directly at first and
-  // reliably scrambled left/right order — see
-  // docs/D-MOVE-IMPLEMENTATION-PLAN.md). `destinationWorkspace` here is
-  // therefore NOT where decomposition's own moves land — it's purely the
-  // real final target, read back only by finishMoveDecomposition() to
-  // chain one genuine cross-workspace replay (root.stashWorkspace ->
-  // destinationWorkspace) once decomposition has finished, exactly
-  // mirroring how restore() replays out of the stash onto wherever the
-  // user's focused workspace is. For stash() itself, destinationWorkspace
-  // is simply root.stashWorkspace again (a no-op distinction) since
-  // there's no separate replay — the batch just stays parked until a
-  // later, independent restore() call. `extra` is merged into the pending
-  // state and read back by completeDecomposition() to decide what happens
-  // once reconstruction finishes — defaults to the stash's own persistent
-  // batchPlans bookkeeping when omitted.
+  // group-collapsed representatives — the moves themselves ARE the stash.
+  // Every destructive move always transits through root.stashWorkspace,
+  // regardless of caller: replaying directly against windows already on
+  // the real final destination scrambles order (docs/D-RECONSTRUCTION.md).
+  // `destinationWorkspace` is therefore the real final target, used only
+  // by finishMoveDecomposition() to chain one cross-workspace replay once
+  // decomposition finishes — for stash() it's just root.stashWorkspace
+  // again (no separate replay). `extra` merges into the pending state for
+  // completeDecomposition() to read.
   function beginDecomposition(batchId, sourceWorkspace, addresses, groupMembersByAddress, destinationWorkspace, extra) {
     root.decompositionInFlight = true
     var state = {
@@ -790,12 +545,9 @@ Item {
     }
   }
 
-  // Not Quickshell.execDetached() — confirmed live (this is what made
-  // zero explicit settle-wait provably safe throughout testing) that a
-  // dispatch Process only exits once Hyprland has actually applied it, so
-  // chaining the next step on onExited gives the same free correctness
-  // guarantee in production that made every experiment's zero-wait
-  // captures reliable.
+  // Not Quickshell.execDetached() — a dispatch Process only exits once
+  // Hyprland has actually applied it, so chaining the next step on
+  // onExited needs no explicit settle-wait.
   Process {
     id: decomposeDispatchProcess
     property string luaExpr: ""
@@ -886,9 +638,8 @@ Item {
   }
 
   // Branches on st.purpose with an explicit whitelist, not an implicit
-  // truthy check — a missing or unrecognized purpose falls back to today's
-  // stash behavior rather than silently taking whichever branch happens to
-  // come first (GPT review amendment).
+  // truthy check — a missing/unrecognized purpose falls back to stash
+  // behavior rather than silently taking whichever branch comes first.
   function completeDecomposition() {
     var st = root.pendingDecomposition
     var result = root.reconstructTree(st.record, st.addresses, st.groupMembersByAddress)
@@ -911,19 +662,11 @@ Item {
   property string pendingStashWorkspace: ""
   property int pendingStashBatchId: 0
 
-  // Move every eligible window on the focused normal workspace into the
-  // stash. Safe to call repeatedly: it appends to whatever is already
-  // parked rather than replacing it. Both *which* windows are eligible and
-  // their geometry come from finishStash() below, off one fresh hyprctl
-  // query — not from Hyprland.toplevels. That cache was tried for
-  // eligibility first (geometry alone was fixed this way earlier), but
-  // under fast repeated stash/restore cycling a window's cached workspace
-  // membership can still briefly read as wherever it was *before* the
-  // previous cycle's move, not after — silently grabbing the wrong subset
-  // and leaving stale geometry/order data behind for whatever got missed.
-  // Only the workspace identity to stash *from* is read synchronously
-  // here, from Hyprland.focusedWorkspace — that tracked reliably in
-  // testing; only per-window state was the unreliable part.
+  // Move every eligible window on the focused workspace into the stash.
+  // Safe to call repeatedly — appends rather than replaces. Eligibility
+  // and geometry come from finishStash() off one fresh hyprctl query, not
+  // Hyprland.toplevels, whose cached workspace membership can briefly
+  // read as stale under fast repeated cycling.
   function stash() {
     var workspace = Hyprland.focusedWorkspace
     if (!workspace || String(workspace.name).indexOf("special:") === 0) return "no-workspace"
@@ -941,12 +684,9 @@ Item {
     command: ["hyprctl", "-j", "clients"]
     stdout: StdioCollector {
       id: stashCaptureOutput
-      // waitForEnd: false so dataChanged fires per chunk as output streams
-      // in, instead of only once the whole thing has already been
-      // collected — needed so the guard below can cut off a runaway
-      // capture before it grows unbounded, not just notice afterward. The
-      // complete text is still available in onExited below exactly as
-      // before; only the timing of intermediate updates changes.
+      // waitForEnd: false so dataChanged fires per chunk, letting the
+      // guard below cut off a runaway capture before it grows unbounded.
+      // Full text is still available in onExited either way.
       waitForEnd: false
       onDataChanged: {
         if (text.length > root.maxCaptureBytes) stashCaptureProcess.running = false
@@ -961,19 +701,11 @@ Item {
     }
   }
 
-  // Determines eligibility *and* captures geometry from the same fresh
-  // query — one ground-truth source for both, instead of letting them
-  // potentially disagree. Meta is recorded for *every* eligible window
-  // here, unconditionally, before any strategy decision — floating and
-  // non-representative group members alike, since geometryClauses() and
-  // resolveLiveAddress() need it later regardless of how the window's
-  // move actually happened. Floating windows get today's exact simple
-  // independent move. Tiled windows are group-collapsed (collapseGroups())
-  // — 0-1 representative left means no reconstruction is possible or
-  // needed (matches today exactly); 2+ hands off to the decomposition
-  // sequencer, whose destructive moves *are* the stash for that batch
-  // (confirmed live in the seam integration test — not a probe followed
-  // by a separate stash pass).
+  // Determines eligibility and captures geometry from the same fresh
+  // query. Meta is recorded for every eligible window unconditionally
+  // (floating and group members alike). Floating windows get a simple
+  // independent move; tiled windows are group-collapsed then handed to
+  // the decomposition sequencer, whose destructive moves ARE the stash.
   function finishStash(clients) {
     var nextMeta = {}
     for (var addr in root.meta) nextMeta[addr] = root.meta[addr]
@@ -1014,29 +746,21 @@ Item {
     }
     if (tiledClients.length === 0) return
 
-    // Unified D pipeline (experiment/d-unified-pipeline): every tiled
-    // batch enters beginDecomposition() unconditionally, no representative
-    // -count special-casing here. representatives.length is always >= 1
-    // at this point (tiledClients.length > 0 was already checked above).
-    // beginDecomposition()/onDecomposeCapture()/finishDecompositionSurvivor()
-    // already degrade correctly to a single quick capture + one survivor
-    // move + a trivial reconstructTree() identity for representatives.length
-    // === 1 -- no changes needed there, confirmed by reading through the
-    // existing removalOrder = addresses.slice(1) / stepIndex >=
-    // removalOrder.length logic: for a 1-element addresses array,
-    // removalOrder is already empty, so the very first capture callback
-    // takes the "finish immediately" path with zero destructive steps.
+    // Every tiled batch enters beginDecomposition() unconditionally, no
+    // representative-count special-casing — it already degrades correctly
+    // to one quick capture + one survivor move + a trivial identity tree
+    // when there's only one representative (removalOrder is empty, so the
+    // first capture callback finishes immediately with zero destructive
+    // steps).
     var grouped = root.collapseGroups(tiledClients)
     var representatives = Object.keys(grouped.representativeOf)
     root.beginDecomposition(root.pendingStashBatchId, root.pendingStashWorkspace, representatives, grouped.representativeOf, root.stashWorkspace)
   }
 
-  // Whether any live toplevel is already on `workspaceName` — read from the
-  // reactive Hyprland.toplevels model, not a fresh query: unlike the
-  // eligibility/geometry bugs this file has otherwise had to work around
-  // (see finishStash() above), this only ever asks about windows the
-  // current operation hasn't itself just touched, so the staleness that
-  // mattered there doesn't apply here.
+  // Whether any live toplevel is already on `workspaceName` — reads the
+  // reactive Hyprland.toplevels model rather than a fresh query, safe here
+  // since this only ever asks about windows the current operation hasn't
+  // itself just touched.
   function isWorkspaceOccupied(workspaceName) {
     var values = Hyprland.toplevels && Hyprland.toplevels.values ? Hyprland.toplevels.values : []
     for (var i = 0; i < values.length; i++) {
@@ -1093,30 +817,15 @@ Item {
     }
   }
 
-  // structureClauses() focuses each tiled window as it's placed, to keep
-  // Dwindle's split order correct (see restoreOrder() above) — but
-  // Hyprland's default cursor-follows-focus behavior means every one of
-  // those focus calls also warps the mouse cursor, landing it wherever the
-  // *last* restored window ends up. Confirmed against the real compositor:
-  // cursor position measurably changed after a restore with no physical
-  // mouse movement involved. Changing that globally (cursor:no_warps) was
-  // ruled out — this project never edits the user's own Hyprland config —
-  // so instead the cursor position is captured before dispatching anything
-  // and explicitly moved back as the last clause in the same batch, after
-  // every focus call has already had its say.
-  // Batches restore oldest-first, same as today. Within a batch: a
-  // resolved, validated tree (root.batchPlans) walks via
-  // walkAndDispatch()'s representative-leaf expansion; anything without
-  // one (unresolved, or a stash from before this change existed) falls
-  // back to today's exact peelOrder()-based flat ordering —
-  // peelOrder()/isSeparated() stay in the file for exactly this. Floating
-  // windows in either case never enter tree/peel logic at all, matching
-  // today. Cross-batch chaining preserved explicitly: today's flat loop
-  // threads one previousMeta continuously across *every* batch, not just
-  // within one (previousMeta is initialized once, before the whole loop,
-  // never reset per batch) — anchorMeta/anchorAddress below carry the
-  // same continuity across both tree-walked and flat-fallback batches
-  // alike, oldest batch first.
+  // structureClauses() focuses each window as it's placed, which also
+  // warps the cursor via Hyprland's cursor-follows-focus — cursor
+  // position is captured before dispatching and restored as the batch's
+  // last clause, rather than editing the user's Hyprland config globally.
+  //
+  // Batches restore oldest-first. A resolved tree walks via
+  // walkAndDispatch(); anything unresolved falls back to natural
+  // placement. anchorMeta/anchorAddress thread the cross-batch anchor
+  // continuously across every batch either way.
   function finishRestore(cursor) {
     var snapshot = root.pendingRestoreSnapshot
     var destination = root.pendingRestoreDestination
@@ -1134,20 +843,12 @@ Item {
     }
     batchIds.sort(function(a, b) { return a - b })
 
-    // Cross-batch merge geometry fix: each batch's tiled windows were
-    // captured with absolute sizes valid only relative to whatever else
-    // was on THEIR OWN original source workspace — never relative to any
-    // other batch. Forcing two independently-captured batches' absolute
-    // sizes into the same destination collapses one of them (confirmed
-    // live: a lone full-workspace window from workspace 1 merged with a
-    // lone full-workspace window from workspace 2 squeezed the second down
-    // to a sliver). root.isWorkspaceOccupied() above only catches the
-    // destination having OTHER, pre-existing content before this restore
-    // started — it says nothing about this restore itself merging 2+
-    // independent batches together. counted by unique batchIds among
-    // TILED windows only (GPT review) — a second, floating-only batch
-    // shouldn't suppress a tiled batch's own resize, since floating
-    // geometry never depends on tiled sibling structure anyway.
+    // Each batch's sizes are only valid relative to their own source
+    // workspace — forcing two independent batches' sizes into one
+    // destination collapses one (confirmed: squeezed one to a sliver).
+    // isWorkspaceOccupied() only catches pre-existing content, not this
+    // restore merging 2+ batches. Counted by TILED-only batch IDs — a
+    // floating-only batch shouldn't suppress a tiled batch's resize.
     var tiledBatchCount = 0
     for (var tb = 0; tb < batchIds.length; tb++) {
       var tbAddrs = byBatch[batchIds[tb]]
@@ -1194,21 +895,10 @@ Item {
         anchorMeta = walked.lastMeta
         anchorAddress = walked.lastAddress
       } else if (tiledAddrs.length > 0) {
-        // No resolved tree for this batch — either a genuine D
-        // reconstruction failure (plan.unresolved, never observed live
-        // across this whole session) or a legacy stash from before every
-        // batch received a BatchPlan (no root.batchPlans entry at all).
-        // Unified D pipeline principle: D either knows the structure or
-        // admits it doesn't — no second, weaker reconstruction engine
-        // (peelOrder()) gets to reinterpret the same failure by guessing
-        // an order. Each window is placed independently — no preselect
-        // chaining, no forced absolute resize — same "natural safe
-        // placement" already used for moveWorkspaceTo()'s own
-        // reconstruction-failure fallback (finishMoveDecomposition()).
-        // peelOrder()/isSeparated()/orderDescriptors() stay physically in
-        // this file (experiment: not deleted), but are unreachable from
-        // any batch produced by this branch's finishStash()/
-        // finishMoveWorkspace() going forward.
+        // No resolved tree — a genuine D failure (see
+        // docs/D-RECONSTRUCTION.md) or a stash predating BatchPlan.
+        // Placed independently: no preselect chaining, no forced resize,
+        // same as finishMoveDecomposition()'s equivalent fallback.
         for (var n = 0; n < tiledAddrs.length; n++) {
           var nAddr = tiledAddrs[n]
           var nMeta = root.meta[nAddr]
@@ -1246,29 +936,13 @@ Item {
   property var pendingMoveSourceMonitor: null
 
   // Bulk workspace-move: relocate every eligible window on the current
-  // workspace onto workspace `targetWorkspaceId`, preserving layout
-  // best-effort, without following focus there. Still deliberately
-  // orthogonal to the stash in every way that matters to the user or to
-  // this file's own bookkeeping: never reads or writes root.meta, never
-  // stores anything in root.batchPlans, and runs through its own capture
-  // Process rather than stashCaptureProcess, so a stash and a bulk-move
-  // triggered close together can never cross wires or contend over the
-  // same persistent state. One exception, internal only: 2+ tiled group
-  // representatives share the exact same decomposition sequencer stash()
-  // uses (root.pendingDecomposition, root.decompositionInFlight), which
-  // transits through root.stashWorkspace exactly like a real stash does —
-  // confirmed live this is load-bearing, not incidental: replaying the
-  // reconstructed tree directly against windows already sitting on the
-  // real final destination (skipping the stash detour) reliably scrambled
-  // left/right order, since Hyprland's insertion behavior for "already on
-  // this workspace, just re-preselect-and-move" isn't the same as a
-  // genuine cross-workspace arrival — see
-  // docs/D-MOVE-IMPLEMENTATION-PLAN.md. The transit is momentary and
-  // invisible to the user (never left there, completes within this same
-  // call), and only ever touches this specific move's own addresses on
-  // the way back out, so it coexists safely with an unrelated real stash
-  // that might already be parked there. See
-  // finishMoveWorkspace()/finishMoveDecomposition() below.
+  // workspace onto `targetWorkspaceId`, preserving layout best-effort.
+  // Orthogonal to the stash: never reads/writes root.meta or
+  // root.batchPlans. Internally, 2+ tiled representatives share the same
+  // decomposition sequencer stash() uses, transiting through
+  // root.stashWorkspace like a real stash — replaying directly against
+  // the real destination scrambles order (docs/D-RECONSTRUCTION.md). The
+  // transit is momentary, coexisting safely with an unrelated real stash.
   function moveWorkspaceTo(targetWorkspaceId) {
     var workspace = Hyprland.focusedWorkspace
     if (!workspace || String(workspace.name).indexOf("special:") === 0) return "no-workspace"
@@ -1303,16 +977,12 @@ Item {
     }
   }
 
-  // Same fresh-query-is-ground-truth approach as finishStash(), but the
-  // resulting metaMap lives only in this call's local scope, never
-  // root.meta — a bulk move has nothing to remember afterward, so there's
-  // no bookkeeping to keep in sync with anything else. metaMap is built
-  // once, here, and never mutated afterward (GPT review amendment 2) —
-  // walkAndDispatch() (for the 2+ representative path, via
-  // finishMoveDecomposition()) reads geometry from it exactly as
-  // restore() reads root.meta, and the values keep reflecting each
-  // window's *original* source-workspace geometry even after
-  // decomposition has physically relocated the windows themselves.
+  // Same fresh-query-is-ground-truth approach as finishStash(), but
+  // metaMap lives only in this call's local scope, never root.meta — a
+  // bulk move has nothing to remember afterward. Built once, never
+  // mutated: walkAndDispatch() reads geometry from it exactly as
+  // restore() reads root.meta, reflecting each window's original
+  // source-workspace geometry even after decomposition relocates it.
   function finishMoveWorkspace(clients) {
     var metaMap = {}
     var sourceClients = []
@@ -1345,13 +1015,10 @@ Item {
     // not solved further here).
     var monitor = (targetWorkspace && targetWorkspace.monitor) || root.pendingMoveSourceMonitor || null
 
-    // Frozen occupancy snapshot (GPT review amendment 1): computed exactly
-    // once, here, from this same fresh capture, before anything moves —
-    // never recomputed mid-operation. Decomposition's own destructive
-    // per-step moves land windows on `destination` partway through the
-    // sequence; occupied must keep reflecting whether the destination had
-    // *other, pre-existing* windows before this operation started, not
-    // whatever it happens to hold right now.
+    // Frozen occupancy snapshot: computed once, before anything moves,
+    // never recomputed mid-operation — decomposition's own moves land
+    // windows on `destination` partway through, so this must keep
+    // reflecting pre-existing content, not current state.
     var occupied = clients.some(function(c) {
       return c && c.workspace && c.workspace.name === destination
     })
@@ -1366,11 +1033,9 @@ Item {
     }
 
     // Floating windows' clauses are built now but never dispatched on
-    // their own — held until the tiled path below has fully resolved
-    // (trivial move, decomposition success, or decomposition failure),
-    // then dispatched together as one combined hyprctl --batch. Floating
-    // windows stay physically untouched until then (GPT review amendment
-    // 5), same as finishStash()'s own floating/tiled separation.
+    // their own — held until the tiled path resolves, then dispatched
+    // together as one combined batch. Floating windows stay physically
+    // untouched until then, same as finishStash()'s own separation.
     var floatingStructure = []
     var floatingGeometry = []
     for (var f = 0; f < floatingAddresses.length; f++) {
@@ -1386,17 +1051,11 @@ Item {
       return
     }
 
-    // Unified D pipeline (experiment/d-unified-pipeline): every tiled
-    // batch (1+ representatives) hands off to the same decomposition
-    // sequencer stash() uses, no representative-count special-casing —
-    // see finishStash() above for why this degrades correctly for a
-    // single representative with no extra async cost beyond one capture
-    // round-trip. destinationWorkspace is the real target; per the
-    // stash-transit design, the sequencer's own internal moves always go
-    // through root.stashWorkspace regardless — see
-    // finishMoveDecomposition() below for what happens once it completes
-    // (a genuine cross-workspace replay onto the real destination, same
-    // mechanism whether this batch is a single window or a real grid).
+    // Every tiled batch hands off to the same decomposition sequencer
+    // stash() uses, no representative-count special-casing.
+    // destinationWorkspace is the real target; internal moves always
+    // transit through root.stashWorkspace regardless (see
+    // finishMoveDecomposition() for the resulting replay).
     var grouped = root.collapseGroups(tiledClients)
     var representatives = Object.keys(grouped.representativeOf)
     root.beginDecomposition(0, root.pendingMoveSourceWorkspace, representatives, grouped.representativeOf, destination, {
@@ -1409,16 +1068,11 @@ Item {
     })
   }
 
-  // Purpose "move" completion callback, invoked from completeDecomposition()
-  // once reconstruction has run. By this point every tiled representative
-  // has been destructively relocated onto root.stashWorkspace by the
-  // sequencer itself, exactly like a real stash — never onto
-  // st.destinationWorkspace directly (see beginDecomposition() above for
-  // why that direct-redispatch approach was tried first and reliably
-  // scrambled left/right order live). The resolved-tree case below is
-  // therefore a genuine cross-workspace replay, root.stashWorkspace ->
-  // st.destinationWorkspace, exactly matching restore()'s own proven
-  // mechanism — not a same-workspace redispatch.
+  // "move" completion callback. Every tiled representative has already
+  // been relocated onto root.stashWorkspace by the sequencer, exactly
+  // like a real stash — never onto st.destinationWorkspace directly (see
+  // beginDecomposition()). The resolved-tree case below is therefore a
+  // genuine cross-workspace replay, matching restore()'s own mechanism.
   function finishMoveDecomposition(st, tree) {
     var structure = st.floatingStructure.slice()
     var geometry = st.floatingGeometry.slice()
@@ -1429,24 +1083,11 @@ Item {
       structure = structure.concat(walked.structure)
       geometry = geometry.concat(walked.geometry)
     } else {
-      // Reconstruction failed/unresolved. Unlike stash()'s own unresolved
-      // case (safe to leave parked in root.stashWorkspace indefinitely —
-      // restore() will sort it out later via peelOrder()), leaving these
-      // windows in root.stashWorkspace here would silently strand this
-      // move's windows in the scratchpad: there's no root.batchPlans entry
-      // for a "move" batch, so nothing would ever pull them back out
-      // in the same way a real restore() would (GPT review amendment 4,
-      // revised for the stash-transit design — the original amendment
-      // assumed the failure case left windows already on the real
-      // destination, which stopped being true once decomposition moved to
-      // always transiting through root.stashWorkspace). Still deliberately
-      // avoid a full peelOrder()-based structural reconstruction attempt
-      // against a source topology that no longer exists: instead, every
-      // surviving representative is moved onto the real destination
-      // individually, each treated as if it were the very first window
-      // placed (no preselect chaining, no forced absolute resize) — a
-      // deliberately "natural", structure-free placement, safe precisely
-      // because it doesn't try to reproduce anything.
+      // Reconstruction failed. Unlike stash()'s unresolved case (safe to
+      // leave parked — restore() sorts it out later), a "move" batch has
+      // no root.batchPlans entry to ever recover it, so every survivor is
+      // moved onto the real destination individually instead — no
+      // preselect chaining, no forced resize.
       for (var i = 0; i < st.addresses.length; i++) {
         var repAddr = st.addresses[i]
         var liveAddr = root.resolveLiveAddress(root.makeLeaf(repAddr, st.groupMembersByAddress[repAddr]))
@@ -1495,46 +1136,23 @@ Item {
     return root.hasStash ? root.restore() : root.stash()
   }
 
-  // External-focus collision safeguard: special:workspace-stash must never
-  // surface as a user-facing scratchpad. An external "launch or focus"
-  // command (e.g. Omarchy's stock SUPER+SHIFT+M Spotify binding, or any
-  // similar omarchy-launch-or-focus script) matches windows by class/title
-  // system-wide with no workspace awareness. If the match is parked here,
-  // Hyprland reveals this workspace to satisfy the focus request even
-  // though Hyprland.focusedWorkspace itself never changes, so nothing else
-  // in this file would notice on its own.
+  // External-focus collision safeguard: an external "launch or focus"
+  // command (e.g. a stock Omarchy binding) matches windows by class/title
+  // system-wide — if the match is parked in the stash, Hyprland reveals
+  // that workspace even though Hyprland.focusedWorkspace never changes.
   //
-  // Three invariants below were each the product of a failed first attempt
-  // — see docs/DESIGN-JOURNEY.md for the full investigation. A change here
-  // should not violate any of them:
-  //   1. Detection reads the raw Hyprland event stream (Hyprland.rawEvent,
-  //      "activespecial"), never Quickshell's cached monitor/workspace
-  //      properties — those read back wrong values here, not just a
-  //      missing change signal, even sampled synchronously at the right
-  //      instant.
-  //   2. Deactivation (once the stash empties) is gated on a fresh
-  //      `hyprctl -j monitors` query, not on tracking that same event
-  //      stream — Hyprland does not reliably emit a clean "deactivated"
-  //      event when a special workspace empties out on its own, so a
-  //      purely event-driven flag can race and skip deactivation on
-  //      exactly the case this exists to catch.
-  //   3. No explicit refocus is issued afterward chasing what the external
-  //      shortcut was trying to reach. Hyprland silently substitutes its
-  //      own top-of-stack window for any focus request into an
-  //      already-populated special workspace, and that substitution isn't
-  //      recoverable from the IPC/event stream — forcing focus onto it
-  //      would misrepresent it as the user's actual request. (restore()
-  //      does focus each tiled window as it's placed, for Dwindle
-  //      ordering — see restoreOrder() — which leaves the last restored
-  //      tiled window focused when this collision path finishes. That's
-  //      an unrelated, intentional side effect of getting the layout
-  //      right, not a refocus attempt aimed at the collision itself.)
+  // Three invariants, each from a failed first attempt (docs/DESIGN-JOURNEY.md):
+  //   1. Detection reads the raw event stream (Hyprland.rawEvent,
+  //      "activespecial"), never Quickshell's cached workspace properties.
+  //   2. Deactivation is gated on a fresh `hyprctl -j monitors` query, not
+  //      that same event stream — Hyprland doesn't reliably emit a clean
+  //      "deactivated" event when the workspace empties on its own.
+  //   3. No explicit refocus chases what the external shortcut wanted —
+  //      Hyprland's own substitution isn't recoverable from the event
+  //      stream, and forcing focus would misrepresent the user's intent.
   //
-  // The whole stash restores through the one authoritative restore() every
-  // other input path already uses. Deactivation only ever fires from the
-  // confirmed-active check in finishCollisionRestore() below, so ordinary
-  // stash()/restore() calls (swipe gestures, SUPER+M, SUPER+CTRL+M) can
-  // never accidentally open the special workspace themselves.
+  // Restores through the one authoritative restore(); deactivation only
+  // fires from finishCollisionRestore()'s confirmed-active check.
   property bool collisionRestoreInFlight: false
 
   Connections {
@@ -1546,13 +1164,9 @@ Item {
     }
   }
 
-  // Reentrancy guard: while our own collision-triggered restore is moving
-  // windows out, Hyprland may still report the workspace as active until
-  // the last window leaves, and further activespecial events can arrive
-  // mid-transition. Ignore them entirely while one is already in flight
-  // instead of stacking redundant restore cycles. Not considered complete
-  // until the special workspace is confirmed inactive too, not just an
-  // empty stash — see finishCollisionRestore().
+  // Reentrancy guard: Hyprland may still report the workspace active
+  // until the last window leaves, so further activespecial events can
+  // arrive mid-transition — ignored while one is already in flight.
   function handleExposedStash() {
     if (root.collisionRestoreInFlight) return
     if (!root.hasStash) return
@@ -1560,12 +1174,10 @@ Item {
     root.collisionRestoreInFlight = true
     root.restore()
 
-    // restore() only fires detached moves; it does not guarantee Hyprland
-    // has applied them by the time it returns. Completion is deferred to
-    // onStashedToplevelsChanged above, which fires from the same live
-    // Hyprland toplevel model the bar/count already rely on. This fallback
-    // only covers the case where restore() found nothing to move despite
-    // hasStash just reading true, so the flag can't get stuck.
+    // restore() only fires detached moves; completion is deferred to
+    // onStashedToplevelsChanged above. This fallback covers only the case
+    // where restore() found nothing to move despite hasStash reading
+    // true, so the flag can't get stuck.
     if (root.stashedToplevels.length === 0) root.finishCollisionRestore()
   }
 
