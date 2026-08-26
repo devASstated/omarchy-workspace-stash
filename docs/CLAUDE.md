@@ -101,6 +101,23 @@ fully active: do not change
 limitation without raising it in conversation first, and implement any of
 it only on the dedicated branch, never directly on `main`.
 
+A second, narrower, deliberately-accepted limitation was found and
+investigated on `experiment/d-unified-pipeline`
+(`docs/DUAL-PSEUDO-GEOMETRY-INVESTIGATION.md`): exact geometry
+restoration is not guaranteed when two directly sibling tiled windows
+are both pseudo-tiled — Hyprland may recompute a pseudo-tiled client's
+natural surface size the moment it's touched during replay, even by
+reasserting its own already-correct captured size, so this isn't fixable
+by reordering dispatch clauses. Topology, window safety, and operation
+completion are all unaffected; only that one window's exact surface size
+isn't guaranteed. Deliberately left unfixed — the fix would require
+capturing/persisting pseudo state and threading sibling-awareness through
+`geometryClauses()`, exactly the kind of special-case machinery the
+unified-D refactor (`docs/D-UNIFIED-PIPELINE-COMPARISON.md`) was written
+to eliminate, for a rare, cosmetic-only precondition. Revisit only if
+real usage hits it often enough to matter, or Hyprland exposes a clean
+authoritative pseudo-state API.
+
 Priorities:
 
 1. Preserve the behavior defined in FEATURES.md.
