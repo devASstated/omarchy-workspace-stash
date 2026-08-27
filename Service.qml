@@ -45,10 +45,19 @@ Item {
   }
 
   // Bounds the raw "hyprctl -j clients" output itself, before parsing —
-  // StdioCollector buffers it fully in memory, and clipText() above only
-  // bounds what reaches QML after the fact. A real capture here runs ~2KB;
-  // this leaves generous headroom while refusing pathological output.
+  // clipText() above only bounds what reaches QML after the fact. Enforced
+  // at the pipe itself (see captureClientsCommand below), not by watching
+  // StdioCollector's buffer after the fact: that buffer already holds
+  // whatever the process wrote before any QML handler can react to it. A
+  // real capture here runs ~2KB; this leaves generous headroom while
+  // refusing pathological output.
   readonly property int maxCaptureBytes: 4194304
+
+  // "head -c" enforces the cap in the pipe itself — hyprctl gets SIGPIPE
+  // once head has read enough, so StdioCollector's buffer can never exceed
+  // this regardless of how QML's event loop happens to batch onDataChanged.
+  // The +1 keeps the length check below meaningful as an overflow signal.
+  readonly property var captureClientsCommand: ["sh", "-c", "hyprctl -j clients | head -c " + (maxCaptureBytes + 1)]
 
   // Presentation-ready snapshot for the bar widget: identity and live display
   // fields come straight from Hyprland every time; batch/source come from the
@@ -527,7 +536,7 @@ Item {
 
   Process {
     id: decomposeCaptureProcess
-    command: ["hyprctl", "-j", "clients"]
+    command: root.captureClientsCommand
     stdout: StdioCollector {
       id: decomposeCaptureOutput
       // Same reasoning as stashCaptureOutput/moveCaptureOutput above.
@@ -681,12 +690,13 @@ Item {
 
   Process {
     id: stashCaptureProcess
-    command: ["hyprctl", "-j", "clients"]
+    command: root.captureClientsCommand
     stdout: StdioCollector {
       id: stashCaptureOutput
       // waitForEnd: false so dataChanged fires per chunk, letting the
       // guard below cut off a runaway capture before it grows unbounded.
-      // Full text is still available in onExited either way.
+      // Full text is still available in onExited either way. The real
+      // ceiling is captureClientsCommand's "head -c" — this is a fallback.
       waitForEnd: false
       onDataChanged: {
         if (text.length > root.maxCaptureBytes) stashCaptureProcess.running = false
@@ -958,7 +968,7 @@ Item {
 
   Process {
     id: moveCaptureProcess
-    command: ["hyprctl", "-j", "clients"]
+    command: root.captureClientsCommand
     stdout: StdioCollector {
       id: moveCaptureOutput
       // Same reasoning as stashCaptureOutput above — see there for why
